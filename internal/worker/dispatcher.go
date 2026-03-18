@@ -14,10 +14,11 @@ import (
 )
 
 type Dispatcher struct {
-	store    *store.Store
-	client   *http.Client
-	interval time.Duration
-	batch    int
+	store             *store.Store
+	client            *http.Client
+	interval          time.Duration
+	batch             int
+	processingTimeout time.Duration
 }
 
 func New(s *store.Store) *Dispatcher {
@@ -26,8 +27,9 @@ func New(s *store.Store) *Dispatcher {
 		client: &http.Client{
 			Timeout: 15 * time.Second,
 		},
-		interval: 2 * time.Second,
-		batch:    10,
+		interval:          2 * time.Second,
+		batch:             10,
+		processingTimeout: time.Minute,
 	}
 }
 
@@ -49,7 +51,7 @@ func (d *Dispatcher) Start(ctx context.Context) {
 }
 
 func (d *Dispatcher) poll(ctx context.Context) {
-	jobs, err := d.store.FetchPendingJobs(d.batch)
+	jobs, err := d.store.FetchPendingJobs(d.batch, d.processingTimeout)
 	if err != nil {
 		log.Printf("[worker] fetch jobs error: %v", err)
 		return

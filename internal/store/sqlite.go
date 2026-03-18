@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"github.com/1919chichi/rc_1919chichi/internal/model"
@@ -51,13 +53,19 @@ func (s *Store) migrate() error {
 		updated_at    INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE INDEX IF NOT EXISTS idx_jobs_status_next_retry ON jobs(status, next_retry_at);
+	CREATE INDEX IF NOT EXISTS idx_jobs_status_updated_at ON jobs(status, updated_at);
 	`
 	_, err := s.db.Exec(query)
 	return err
 }
 
 func (s *Store) CreateJob(req model.CreateNotificationRequest) (*model.Job, error) {
-	headersJSON, err := json.Marshal(req.Headers)
+	headers := req.Headers
+	if headers == nil {
+		headers = map[string]string{}
+	}
+
+	headersJSON, err := json.Marshal(headers)
 	if err != nil {
 		return nil, fmt.Errorf("marshal headers: %w", err)
 	}
@@ -77,23 +85,34 @@ func (s *Store) CreateJob(req model.CreateNotificationRequest) (*model.Job, erro
 	return s.GetJob(id)
 }
 
-// FetchPendingJobs atomically selects and locks up to `limit` pending jobs
-// whose next_retry_at has passed.
-func (s *Store) FetchPendingJobs(limit int) ([]model.Job, error) {
+// FetchPendingJobs atomically claims up to `limit` jobs for delivery.
+// It picks:
+// 1) pending jobs whose next_retry_at has passed, and
+// 2) stale processing jobs (for crash recovery).
+func (s *Store) FetchPendingJobs(limit int, processingTimeout time.Duration) ([]model.Job, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
 	now := time.Now().Unix()
+	staleBefore := now - int64(processingTimeout/time.Second)
+	if processingTimeout <= 0 {
+		staleBefore = now
+	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.Query(
 		`SELECT id FROM jobs
-		 WHERE status = ? AND next_retry_at <= ?
-		 ORDER BY next_retry_at ASC
+		 WHERE (status = ? AND next_retry_at <= ?)
+		    OR (status = ? AND updated_at <= ?)
+		 ORDER BY next_retry_at ASC, id ASC
 		 LIMIT ?`,
-		model.StatusPending, now, limit,
+		model.StatusPending, now, model.StatusProcessing, staleBefore, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -109,18 +128,37 @@ func (s *Store) FetchPendingJobs(limit int) ([]model.Job, error) {
 		ids = append(ids, id)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
 	if len(ids) == 0 {
 		return nil, nil
 	}
 
+	claimedIDs := make([]int64, 0, len(ids))
 	for _, id := range ids {
-		_, err := tx.Exec(
-			`UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?`,
+		result, err := tx.Exec(
+			`UPDATE jobs
+			 SET status = ?, updated_at = ?
+			 WHERE id = ?
+			   AND (
+					(status = ? AND next_retry_at <= ?)
+				 OR (status = ? AND updated_at <= ?)
+			   )`,
 			model.StatusProcessing, now, id,
+			model.StatusPending, now,
+			model.StatusProcessing, staleBefore,
 		)
 		if err != nil {
 			return nil, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if affected == 1 {
+			claimedIDs = append(claimedIDs, id)
 		}
 	}
 
@@ -128,8 +166,12 @@ func (s *Store) FetchPendingJobs(limit int) ([]model.Job, error) {
 		return nil, err
 	}
 
-	jobs := make([]model.Job, 0, len(ids))
-	for _, id := range ids {
+	if len(claimedIDs) == 0 {
+		return nil, nil
+	}
+
+	jobs := make([]model.Job, 0, len(claimedIDs))
+	for _, id := range claimedIDs {
 		job, err := s.GetJob(id)
 		if err != nil {
 			return nil, err
@@ -229,7 +271,7 @@ func scanJob(row scannable) (*model.Job, error) {
 	}
 
 	j.Status = model.JobStatus(status)
-	json.Unmarshal([]byte(headersStr), &j.Headers)
+	j.Headers = decodeHeaders(headersStr)
 	j.NextRetryAt = time.Unix(nextRetry, 0).UTC()
 	j.CreatedAt = time.Unix(created, 0).UTC()
 	j.UpdatedAt = time.Unix(updated, 0).UTC()
@@ -248,9 +290,25 @@ func scanJobFromRows(rows *sql.Rows) (*model.Job, error) {
 	}
 
 	j.Status = model.JobStatus(status)
-	json.Unmarshal([]byte(headersStr), &j.Headers)
+	j.Headers = decodeHeaders(headersStr)
 	j.NextRetryAt = time.Unix(nextRetry, 0).UTC()
 	j.CreatedAt = time.Unix(created, 0).UTC()
 	j.UpdatedAt = time.Unix(updated, 0).UTC()
 	return &j, nil
+}
+
+func decodeHeaders(headersStr string) map[string]string {
+	if strings.TrimSpace(headersStr) == "" {
+		return map[string]string{}
+	}
+
+	var headers map[string]string
+	if err := json.Unmarshal([]byte(headersStr), &headers); err != nil {
+		log.Printf("[store] invalid headers JSON %q: %v", headersStr, err)
+		return map[string]string{}
+	}
+	if headers == nil {
+		return map[string]string{}
+	}
+	return headers
 }

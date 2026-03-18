@@ -33,6 +33,7 @@ vendor/
 .vscode/
 *.swp
 *.swo
+.lh/
 
 # macOS
 .DS_Store

@@ -2,7 +2,10 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -12,6 +15,16 @@ import (
 
 type Handler struct {
 	store *store.Store
+}
+
+const maxCreateRequestBodyBytes = 1 << 20 // 1MB
+
+var allowedHTTPMethods = map[string]struct{}{
+	http.MethodGet:    {},
+	http.MethodPost:   {},
+	http.MethodPut:    {},
+	http.MethodPatch:  {},
+	http.MethodDelete: {},
 }
 
 func New(s *store.Store) *Handler {
@@ -31,54 +44,100 @@ func (h *Handler) handleNotifications(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		h.Create(w, r)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		methodNotAllowed(w, http.MethodPost)
 	}
 }
 
 func (h *Handler) handleNotificationByID(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/notifications/")
+	if path == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "route not found"})
+		return
+	}
 
-	if path == "failed" && r.Method == http.MethodGet {
+	if path == "failed" {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
 		h.ListFailed(w, r)
 		return
 	}
 
 	parts := strings.Split(path, "/")
-	id, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid job id"})
-		return
-	}
-
-	if len(parts) == 2 && parts[1] == "replay" && r.Method == http.MethodPost {
-		h.Replay(w, r, id)
-		return
-	}
-
-	if r.Method == http.MethodGet {
+	switch {
+	case len(parts) == 1:
+		id, err := parseJobID(parts[0])
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid job id"})
+			return
+		}
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
 		h.Get(w, r, id)
-		return
+	case len(parts) == 2 && parts[1] == "replay":
+		id, err := parseJobID(parts[0])
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid job id"})
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.Replay(w, r, id)
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "route not found"})
 	}
-
-	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxCreateRequestBodyBytes)
+
 	var req model.CreateNotificationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body too large"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json: " + err.Error()})
 		return
 	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must contain a single JSON object"})
+		return
+	}
+
+	req.URL = strings.TrimSpace(req.URL)
+	req.Method = strings.ToUpper(strings.TrimSpace(req.Method))
 
 	if req.URL == "" || req.Method == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url and method are required"})
 		return
 	}
 
-	allowed := map[string]bool{"GET": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true}
-	if !allowed[req.Method] {
+	parsedURL, err := url.ParseRequestURI(req.URL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url must be a valid http/https URL"})
+		return
+	}
+
+	if _, ok := allowedHTTPMethods[req.Method]; !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "method must be one of GET, POST, PUT, PATCH, DELETE"})
 		return
+	}
+
+	for key := range req.Headers {
+		if strings.TrimSpace(key) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "header name cannot be empty"})
+			return
+		}
 	}
 
 	job, err := h.store.CreateJob(req)
@@ -129,5 +188,23 @@ func (h *Handler) Replay(w http.ResponseWriter, _ *http.Request, id int64) {
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+func methodNotAllowed(w http.ResponseWriter, allowedMethods ...string) {
+	if len(allowedMethods) > 0 {
+		w.Header().Set("Allow", strings.Join(allowedMethods, ", "))
+	}
+	writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+}
+
+func parseJobID(raw string) (int64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, errors.New("empty job id")
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, errors.New("invalid job id")
+	}
+	return id, nil
 }
