@@ -26,28 +26,28 @@ const DefaultMaxRetries = 3
 // struct 是 Go 中用来组合数据的方式，类似其他语言中的 class 或 object
 // 每个字段有三部分：字段名、类型、标签（backtick 中的内容）
 type Job struct {
-	// `json:"id"` 是结构体标签（struct tag），告诉 JSON 序列化器：
-	// 当这个结构体转成 JSON 时，这个字段的 key 应该叫 "id"
-	ID          int64             `json:"id"`                // 任务唯一标识，int64 = 64位整数
-	URL         string            `json:"url"`               // 通知目标地址
-	Method      string            `json:"method"`            // HTTP 方法（GET/POST 等）
-	Headers     map[string]string `json:"headers,omitempty"` // HTTP 请求头，map[string]string = 字符串到字符串的映射（字典）；omitempty 表示为空时 JSON 中省略该字段
-	Body        string            `json:"body,omitempty"`    // HTTP 请求体
-	Status      JobStatus         `json:"status"`            // 当前状态
-	RetryCount  int               `json:"retry_count"`       // 已重试次数
-	MaxRetries  int               `json:"max_retries"`       // 最大重试次数
-	NextRetryAt time.Time         `json:"next_retry_at"`     // 下次重试时间，time.Time 是 Go 的时间类型
-	LastError   string            `json:"last_error,omitempty"` // 最后一次错误信息
-	CreatedAt   time.Time         `json:"created_at"`        // 创建时间
-	UpdatedAt   time.Time         `json:"updated_at"`        // 更新时间
+	ID          int64             `json:"id"`
+	VendorID    string            `json:"vendor_id"`
+	Event       string            `json:"event"`
+	URL         string            `json:"url"`
+	Method      string            `json:"method"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Body        string            `json:"body,omitempty"`
+	Status      JobStatus         `json:"status"`
+	RetryCount  int               `json:"retry_count"`
+	MaxRetries  int               `json:"max_retries"`
+	NextRetryAt time.Time         `json:"next_retry_at"`
+	LastError   string            `json:"last_error,omitempty"`
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
-// CreateNotificationRequest 是 POST /api/notifications 接口接收的请求体结构
+// CreateNotificationRequest is the request body for POST /api/notifications.
+// Callers only specify which vendor, what event, and the event payload.
 type CreateNotificationRequest struct {
-	URL     string            `json:"url" binding:"required"`     // binding:"required" 标记该字段为必填（但本项目用标准库，实际靠代码逻辑验证）
-	Method  string            `json:"method" binding:"required"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Body    string            `json:"body,omitempty"`
+	VendorID string         `json:"vendor_id"`
+	Event    string         `json:"event"`
+	Payload  map[string]any `json:"payload,omitempty"`
 }
 
 // BackoffDuration 计算指数退避的等待时间

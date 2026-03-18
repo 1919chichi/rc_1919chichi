@@ -57,10 +57,11 @@ func (s *Store) Close() error {
 // 小写字母开头的函数/方法是私有的（unexported），只能在包内访问
 // 大写字母开头的才是公开的（exported），类似其他语言的 public/private
 func (s *Store) migrate() error {
-	// 反引号 ` 包裹的是原始字符串（raw string），可以跨多行，不需要转义
 	query := `
 	CREATE TABLE IF NOT EXISTS jobs (
 		id            INTEGER PRIMARY KEY AUTOINCREMENT,
+		vendor_id     TEXT    NOT NULL DEFAULT '',
+		event         TEXT    NOT NULL DEFAULT '',
 		url           TEXT    NOT NULL,
 		method        TEXT    NOT NULL DEFAULT 'POST',
 		headers       TEXT    NOT NULL DEFAULT '{}',
@@ -75,43 +76,64 @@ func (s *Store) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_jobs_status_next_retry ON jobs(status, next_retry_at);
 	CREATE INDEX IF NOT EXISTS idx_jobs_status_updated_at ON jobs(status, updated_at);
-	`
-	// s.db.Exec 执行 SQL 语句（不返回结果行）
-	_, err := s.db.Exec(query)
-	return err
-}
 
-// CreateJob 在数据库中创建一个新的通知任务
-func (s *Store) CreateJob(req model.CreateNotificationRequest) (*model.Job, error) {
-	headers := req.Headers
-	if headers == nil {
-		// map[string]string{} 创建一个空的 map（字典）
-		headers = map[string]string{}
+	CREATE TABLE IF NOT EXISTS vendors (
+		id          TEXT PRIMARY KEY,
+		name        TEXT    NOT NULL,
+		base_url    TEXT    NOT NULL,
+		method      TEXT    NOT NULL DEFAULT 'POST',
+		auth_type   TEXT    NOT NULL DEFAULT '',
+		auth_config TEXT    NOT NULL DEFAULT '{}',
+		headers     TEXT    NOT NULL DEFAULT '{}',
+		body_tpl    TEXT    NOT NULL DEFAULT '',
+		max_retries INTEGER NOT NULL DEFAULT 3,
+		is_active   INTEGER NOT NULL DEFAULT 1,
+		created_at  INTEGER NOT NULL DEFAULT 0,
+		updated_at  INTEGER NOT NULL DEFAULT 0
+	);
+	`
+	if _, err := s.db.Exec(query); err != nil {
+		return err
 	}
 
-	// json.Marshal 将 Go 数据结构序列化为 JSON 字节切片
+	// Backwards-compatible: add columns to existing jobs tables.
+	for _, q := range []string{
+		"ALTER TABLE jobs ADD COLUMN vendor_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE jobs ADD COLUMN event TEXT NOT NULL DEFAULT ''",
+	} {
+		s.db.Exec(q) // ignore "duplicate column" errors
+	}
+	return nil
+}
+
+// CreateJob persists a fully-resolved notification job.
+func (s *Store) CreateJob(p model.CreateJobParams) (*model.Job, error) {
+	headers := p.Headers
+	if headers == nil {
+		headers = map[string]string{}
+	}
 	headersJSON, err := json.Marshal(headers)
 	if err != nil {
 		return nil, fmt.Errorf("marshal headers: %w", err)
 	}
 
-	// time.Now().Unix() 获取当前时间的 Unix 时间戳（秒数）
+	maxRetries := p.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = model.DefaultMaxRetries
+	}
+
 	now := time.Now().Unix()
-	// s.db.Exec 执行 INSERT SQL 语句
-	// ? 是参数占位符，防止 SQL 注入（后面的参数按顺序替换 ?）
 	result, err := s.db.Exec(
-		`INSERT INTO jobs (url, method, headers, body, status, max_retries, next_retry_at, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		req.URL, req.Method, string(headersJSON), req.Body,
-		model.StatusPending, model.DefaultMaxRetries, now, now, now,
+		`INSERT INTO jobs (vendor_id, event, url, method, headers, body, status, max_retries, next_retry_at, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.VendorID, p.Event, p.URL, p.Method, string(headersJSON), p.Body,
+		model.StatusPending, maxRetries, now, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert job: %w", err)
 	}
 
-	// result.LastInsertId() 获取刚插入行的自增 ID
 	id, _ := result.LastInsertId()
-	// 插入后再查询一次，返回完整的 Job 对象
 	return s.GetJob(id)
 }
 
@@ -235,14 +257,11 @@ func (s *Store) FetchPendingJobs(limit int, processingTimeout time.Duration) ([]
 	return jobs, nil
 }
 
-// GetJob 根据 ID 查询单个任务
 func (s *Store) GetJob(id int64) (*model.Job, error) {
-	// QueryRow 执行查询并返回最多一行结果
 	row := s.db.QueryRow(
-		`SELECT id, url, method, headers, body, status, retry_count, max_retries,
-		        next_retry_at, last_error, created_at, updated_at
+		`SELECT id, vendor_id, event, url, method, headers, body, status,
+		        retry_count, max_retries, next_retry_at, last_error, created_at, updated_at
 		 FROM jobs WHERE id = ?`, id)
-	// 调用辅助函数将数据库行扫描为 Job 结构体
 	return scanJob(row)
 }
 
@@ -277,12 +296,10 @@ func (s *Store) MarkFailed(id int64, lastError string) error {
 	return err
 }
 
-// ListFailedJobs 查询所有失败的任务，按更新时间倒序排列
 func (s *Store) ListFailedJobs() ([]model.Job, error) {
-	// Query 执行查询并返回多行结果（与 QueryRow 的区别）
 	rows, err := s.db.Query(
-		`SELECT id, url, method, headers, body, status, retry_count, max_retries,
-		        next_retry_at, last_error, created_at, updated_at
+		`SELECT id, vendor_id, event, url, method, headers, body, status,
+		        retry_count, max_retries, next_retry_at, last_error, created_at, updated_at
 		 FROM jobs WHERE status = ? ORDER BY updated_at DESC`, model.StatusFailed,
 	)
 	if err != nil {
@@ -328,37 +345,13 @@ type scannable interface {
 	Scan(dest ...any) error // ...any 表示接受任意数量、任意类型的参数
 }
 
-// scanJob 将数据库查询结果的一行扫描（读取）为 Job 结构体
 func scanJob(row scannable) (*model.Job, error) {
-	var j model.Job                        // 声明一个 Job 变量（零值初始化）
-	var headersStr, status string          // 数据库中 headers 和 status 以字符串存储
-	var nextRetry, created, updated int64  // 数据库中时间以 Unix 时间戳（整数）存储
-
-	// row.Scan 按顺序将查询结果的各列读取到对应变量中
-	// 每个参数都必须是指针（&变量名）
-	err := row.Scan(&j.ID, &j.URL, &j.Method, &headersStr, &j.Body, &status,
-		&j.RetryCount, &j.MaxRetries, &nextRetry, &j.LastError, &created, &updated)
-	if err != nil {
-		return nil, err
-	}
-
-	// 将数据库中的原始值转换为 Go 类型
-	j.Status = model.JobStatus(status)              // 类型转换：string -> JobStatus
-	j.Headers = decodeHeaders(headersStr)            // JSON 字符串 -> map
-	j.NextRetryAt = time.Unix(nextRetry, 0).UTC()   // Unix 时间戳 -> time.Time
-	j.CreatedAt = time.Unix(created, 0).UTC()
-	j.UpdatedAt = time.Unix(updated, 0).UTC()
-	return &j, nil // 返回 Job 的指针
-}
-
-// scanJobFromRows 功能同 scanJob，但接收 *sql.Rows 类型
-// 这是因为 *sql.Rows 和 *sql.Row 的 Scan 方法签名略有不同
-func scanJobFromRows(rows *sql.Rows) (*model.Job, error) {
 	var j model.Job
 	var headersStr, status string
 	var nextRetry, created, updated int64
 
-	err := rows.Scan(&j.ID, &j.URL, &j.Method, &headersStr, &j.Body, &status,
+	err := row.Scan(&j.ID, &j.VendorID, &j.Event,
+		&j.URL, &j.Method, &headersStr, &j.Body, &status,
 		&j.RetryCount, &j.MaxRetries, &nextRetry, &j.LastError, &created, &updated)
 	if err != nil {
 		return nil, err
@@ -372,8 +365,188 @@ func scanJobFromRows(rows *sql.Rows) (*model.Job, error) {
 	return &j, nil
 }
 
-// decodeHeaders 将 JSON 字符串解析为 map[string]string
-// 如果解析失败（如数据库中存了无效 JSON），返回空 map 而不是报错
+func scanJobFromRows(rows *sql.Rows) (*model.Job, error) {
+	var j model.Job
+	var headersStr, status string
+	var nextRetry, created, updated int64
+
+	err := rows.Scan(&j.ID, &j.VendorID, &j.Event,
+		&j.URL, &j.Method, &headersStr, &j.Body, &status,
+		&j.RetryCount, &j.MaxRetries, &nextRetry, &j.LastError, &created, &updated)
+	if err != nil {
+		return nil, err
+	}
+
+	j.Status = model.JobStatus(status)
+	j.Headers = decodeHeaders(headersStr)
+	j.NextRetryAt = time.Unix(nextRetry, 0).UTC()
+	j.CreatedAt = time.Unix(created, 0).UTC()
+	j.UpdatedAt = time.Unix(updated, 0).UTC()
+	return &j, nil
+}
+
+// --------------- Vendor CRUD ---------------
+
+func (s *Store) GetVendor(id string) (*model.VendorConfig, error) {
+	row := s.db.QueryRow(
+		`SELECT id, name, base_url, method, auth_type, auth_config, headers,
+		        body_tpl, max_retries, is_active, created_at, updated_at
+		 FROM vendors WHERE id = ?`, id)
+	return scanVendor(row)
+}
+
+func (s *Store) ListVendors() ([]model.VendorConfig, error) {
+	rows, err := s.db.Query(
+		`SELECT id, name, base_url, method, auth_type, auth_config, headers,
+		        body_tpl, max_retries, is_active, created_at, updated_at
+		 FROM vendors ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var vendors []model.VendorConfig
+	for rows.Next() {
+		v, err := scanVendorFromRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		vendors = append(vendors, *v)
+	}
+	return vendors, nil
+}
+
+func (s *Store) CreateVendor(req model.CreateVendorRequest) (*model.VendorConfig, error) {
+	authCfg, err := json.Marshal(nonNilMap(req.AuthConfig))
+	if err != nil {
+		return nil, fmt.Errorf("marshal auth_config: %w", err)
+	}
+	hdrs, err := json.Marshal(nonNilMap(req.Headers))
+	if err != nil {
+		return nil, fmt.Errorf("marshal headers: %w", err)
+	}
+
+	method := req.Method
+	if method == "" {
+		method = "POST"
+	}
+	maxRetries := req.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = model.DefaultMaxRetries
+	}
+
+	now := time.Now().Unix()
+	_, err = s.db.Exec(
+		`INSERT INTO vendors (id, name, base_url, method, auth_type, auth_config, headers, body_tpl, max_retries, is_active, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		req.ID, req.Name, req.BaseURL, method, req.AuthType,
+		string(authCfg), string(hdrs), req.BodyTpl, maxRetries, now, now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert vendor: %w", err)
+	}
+	return s.GetVendor(req.ID)
+}
+
+func (s *Store) UpdateVendor(id string, req model.UpdateVendorRequest) (*model.VendorConfig, error) {
+	authCfg, err := json.Marshal(nonNilMap(req.AuthConfig))
+	if err != nil {
+		return nil, fmt.Errorf("marshal auth_config: %w", err)
+	}
+	hdrs, err := json.Marshal(nonNilMap(req.Headers))
+	if err != nil {
+		return nil, fmt.Errorf("marshal headers: %w", err)
+	}
+
+	method := req.Method
+	if method == "" {
+		method = "POST"
+	}
+	maxRetries := req.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = model.DefaultMaxRetries
+	}
+
+	now := time.Now().Unix()
+	result, err := s.db.Exec(
+		`UPDATE vendors SET name=?, base_url=?, method=?, auth_type=?, auth_config=?, headers=?, body_tpl=?, max_retries=?, updated_at=?
+		 WHERE id = ?`,
+		req.Name, req.BaseURL, method, req.AuthType,
+		string(authCfg), string(hdrs), req.BodyTpl, maxRetries, now, id,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("update vendor: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return nil, fmt.Errorf("vendor %q not found", id)
+	}
+	return s.GetVendor(id)
+}
+
+func (s *Store) DeleteVendor(id string) error {
+	now := time.Now().Unix()
+	result, err := s.db.Exec(
+		`UPDATE vendors SET is_active = 0, updated_at = ? WHERE id = ? AND is_active = 1`, now, id)
+	if err != nil {
+		return fmt.Errorf("delete vendor: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return fmt.Errorf("vendor %q not found or already inactive", id)
+	}
+	return nil
+}
+
+func scanVendor(row scannable) (*model.VendorConfig, error) {
+	var v model.VendorConfig
+	var authCfgStr, headersStr string
+	var isActive int
+	var created, updated int64
+
+	err := row.Scan(&v.ID, &v.Name, &v.BaseURL, &v.Method, &v.AuthType,
+		&authCfgStr, &headersStr, &v.BodyTpl, &v.MaxRetries, &isActive, &created, &updated)
+	if err != nil {
+		return nil, err
+	}
+
+	v.AuthConfig = decodeHeaders(authCfgStr)
+	v.Headers = decodeHeaders(headersStr)
+	v.IsActive = isActive == 1
+	v.CreatedAt = time.Unix(created, 0).UTC()
+	v.UpdatedAt = time.Unix(updated, 0).UTC()
+	return &v, nil
+}
+
+func scanVendorFromRows(rows *sql.Rows) (*model.VendorConfig, error) {
+	var v model.VendorConfig
+	var authCfgStr, headersStr string
+	var isActive int
+	var created, updated int64
+
+	err := rows.Scan(&v.ID, &v.Name, &v.BaseURL, &v.Method, &v.AuthType,
+		&authCfgStr, &headersStr, &v.BodyTpl, &v.MaxRetries, &isActive, &created, &updated)
+	if err != nil {
+		return nil, err
+	}
+
+	v.AuthConfig = decodeHeaders(authCfgStr)
+	v.Headers = decodeHeaders(headersStr)
+	v.IsActive = isActive == 1
+	v.CreatedAt = time.Unix(created, 0).UTC()
+	v.UpdatedAt = time.Unix(updated, 0).UTC()
+	return &v, nil
+}
+
+func nonNilMap(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
+}
+
+// --------------- Helpers ---------------
+
 func decodeHeaders(headersStr string) map[string]string {
 	if strings.TrimSpace(headersStr) == "" {
 		return map[string]string{}

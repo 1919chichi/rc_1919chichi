@@ -12,10 +12,10 @@ import (
 	"syscall"   // syscall 包：提供操作系统底层信号的常量（如 SIGINT、SIGTERM）
 	"time"      // time 包：时间相关的工具
 
-	// 以下是本项目内部的包（internal 表示仅项目内部可用）
-	"github.com/1919chichi/rc_1919chichi/internal/handler" // HTTP 接口处理层
-	"github.com/1919chichi/rc_1919chichi/internal/store"   // 数据库存储层
-	"github.com/1919chichi/rc_1919chichi/internal/worker"  // 后台任务调度器
+	"github.com/1919chichi/rc_1919chichi/internal/handler"
+	"github.com/1919chichi/rc_1919chichi/internal/store"
+	"github.com/1919chichi/rc_1919chichi/internal/vendor"
+	"github.com/1919chichi/rc_1919chichi/internal/worker"
 )
 
 // func main() —— Go 程序的入口函数，程序从这里开始执行
@@ -48,17 +48,14 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // 同样用 defer 确保 main 退出时取消
 
-	// worker.New(db) 创建一个后台任务调度器，负责轮询数据库并投递 HTTP 请求
+	registry := vendor.NewRegistry(db)
+	// registry.Register(myAdapter) — register code-level adapters here
+
 	dispatcher := worker.New(db)
-	// go 关键字：启动一个 goroutine（Go 的轻量级线程/协程）
-	// 这样 dispatcher.Start 在后台运行，不会阻塞主流程
 	go dispatcher.Start(ctx)
 
-	// http.NewServeMux() 创建一个 HTTP 路由器（类似其他框架的 Router）
 	mux := http.NewServeMux()
-	// handler.New(db) 创建 HTTP 接口处理器
-	h := handler.New(db)
-	// 将路由规则注册到路由器上
+	h := handler.New(db, registry)
 	h.RegisterRoutes(mux)
 
 	// &http.Server{...} —— & 取地址符，创建一个 http.Server 的指针
