@@ -44,6 +44,7 @@ type UpdateVendorRequest struct {
 type CreateJobParams struct {
 	VendorID   string
 	Event      string
+	BizID      string
 	URL        string
 	Method     string
 	Headers    map[string]string

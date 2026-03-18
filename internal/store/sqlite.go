@@ -3,17 +3,15 @@ package store
 
 import (
 	"database/sql" // Go 标准库的数据库接口（类似 JDBC），定义了通用的 SQL 操作接口
-	"encoding/json" // JSON 编解码
-	"fmt"           // 格式化输出（类似 printf）
-	"log"           // 日志
-	"strings"       // 字符串操作
-	"time"          // 时间
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"time"
 
 	"github.com/1919chichi/rc_1919chichi/internal/model"
-	// _ "github.com/mattn/go-sqlite3" —— 下划线导入（blank import）
-	// 只执行该包的 init() 函数来注册 SQLite 驱动，不直接使用该包的任何导出符号
-	// 这是 Go database/sql 驱动注册的标准模式
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 )
 
 // Store 封装了数据库连接，提供所有数据库操作方法
@@ -62,6 +60,7 @@ func (s *Store) migrate() error {
 		id            INTEGER PRIMARY KEY AUTOINCREMENT,
 		vendor_id     TEXT    NOT NULL DEFAULT '',
 		event         TEXT    NOT NULL DEFAULT '',
+		biz_id        TEXT    NOT NULL DEFAULT '',
 		url           TEXT    NOT NULL,
 		method        TEXT    NOT NULL DEFAULT 'POST',
 		headers       TEXT    NOT NULL DEFAULT '{}',
@@ -76,6 +75,7 @@ func (s *Store) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_jobs_status_next_retry ON jobs(status, next_retry_at);
 	CREATE INDEX IF NOT EXISTS idx_jobs_status_updated_at ON jobs(status, updated_at);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_biz_key ON jobs(vendor_id, event, biz_id) WHERE biz_id != '';
 
 	CREATE TABLE IF NOT EXISTS vendors (
 		id          TEXT PRIMARY KEY,
@@ -96,25 +96,28 @@ func (s *Store) migrate() error {
 		return err
 	}
 
-	// Backwards-compatible: add columns to existing jobs tables.
 	for _, q := range []string{
 		"ALTER TABLE jobs ADD COLUMN vendor_id TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE jobs ADD COLUMN event TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE jobs ADD COLUMN biz_id TEXT NOT NULL DEFAULT ''",
 	} {
-		s.db.Exec(q) // ignore "duplicate column" errors
+		s.db.Exec(q)
 	}
+	s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_biz_key ON jobs(vendor_id, event, biz_id) WHERE biz_id != ''`)
 	return nil
 }
 
 // CreateJob persists a fully-resolved notification job.
-func (s *Store) CreateJob(p model.CreateJobParams) (*model.Job, error) {
+// Returns (job, isNew, error). When an identical biz_key already exists,
+// isNew is false and the existing job is returned without creating a duplicate.
+func (s *Store) CreateJob(p model.CreateJobParams) (*model.Job, bool, error) {
 	headers := p.Headers
 	if headers == nil {
 		headers = map[string]string{}
 	}
 	headersJSON, err := json.Marshal(headers)
 	if err != nil {
-		return nil, fmt.Errorf("marshal headers: %w", err)
+		return nil, false, fmt.Errorf("marshal headers: %w", err)
 	}
 
 	maxRetries := p.MaxRetries
@@ -124,17 +127,29 @@ func (s *Store) CreateJob(p model.CreateJobParams) (*model.Job, error) {
 
 	now := time.Now().Unix()
 	result, err := s.db.Exec(
-		`INSERT INTO jobs (vendor_id, event, url, method, headers, body, status, max_retries, next_retry_at, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.VendorID, p.Event, p.URL, p.Method, string(headersJSON), p.Body,
+		`INSERT INTO jobs (vendor_id, event, biz_id, url, method, headers, body, status, max_retries, next_retry_at, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.VendorID, p.Event, p.BizID, p.URL, p.Method, string(headersJSON), p.Body,
 		model.StatusPending, maxRetries, now, now, now,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("insert job: %w", err)
+		var sqliteErr sqlite3.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique {
+			existing, findErr := s.GetJobByBizKey(p.VendorID, p.Event, p.BizID)
+			if findErr != nil {
+				return nil, false, fmt.Errorf("find existing job: %w", findErr)
+			}
+			return existing, false, nil
+		}
+		return nil, false, fmt.Errorf("insert job: %w", err)
 	}
 
 	id, _ := result.LastInsertId()
-	return s.GetJob(id)
+	job, err := s.GetJob(id)
+	if err != nil {
+		return nil, false, err
+	}
+	return job, true, nil
 }
 
 // FetchPendingJobs 原子性地抢占最多 limit 个待投递的任务
@@ -259,9 +274,18 @@ func (s *Store) FetchPendingJobs(limit int, processingTimeout time.Duration) ([]
 
 func (s *Store) GetJob(id int64) (*model.Job, error) {
 	row := s.db.QueryRow(
-		`SELECT id, vendor_id, event, url, method, headers, body, status,
+		`SELECT id, vendor_id, event, biz_id, url, method, headers, body, status,
 		        retry_count, max_retries, next_retry_at, last_error, created_at, updated_at
 		 FROM jobs WHERE id = ?`, id)
+	return scanJob(row)
+}
+
+// GetJobByBizKey finds an existing job by its business dedup key.
+func (s *Store) GetJobByBizKey(vendorID, event, bizID string) (*model.Job, error) {
+	row := s.db.QueryRow(
+		`SELECT id, vendor_id, event, biz_id, url, method, headers, body, status,
+		        retry_count, max_retries, next_retry_at, last_error, created_at, updated_at
+		 FROM jobs WHERE vendor_id = ? AND event = ? AND biz_id = ?`, vendorID, event, bizID)
 	return scanJob(row)
 }
 
@@ -298,7 +322,7 @@ func (s *Store) MarkFailed(id int64, lastError string) error {
 
 func (s *Store) ListFailedJobs() ([]model.Job, error) {
 	rows, err := s.db.Query(
-		`SELECT id, vendor_id, event, url, method, headers, body, status,
+		`SELECT id, vendor_id, event, biz_id, url, method, headers, body, status,
 		        retry_count, max_retries, next_retry_at, last_error, created_at, updated_at
 		 FROM jobs WHERE status = ? ORDER BY updated_at DESC`, model.StatusFailed,
 	)
@@ -350,7 +374,7 @@ func scanJob(row scannable) (*model.Job, error) {
 	var headersStr, status string
 	var nextRetry, created, updated int64
 
-	err := row.Scan(&j.ID, &j.VendorID, &j.Event,
+	err := row.Scan(&j.ID, &j.VendorID, &j.Event, &j.BizID,
 		&j.URL, &j.Method, &headersStr, &j.Body, &status,
 		&j.RetryCount, &j.MaxRetries, &nextRetry, &j.LastError, &created, &updated)
 	if err != nil {
@@ -370,7 +394,7 @@ func scanJobFromRows(rows *sql.Rows) (*model.Job, error) {
 	var headersStr, status string
 	var nextRetry, created, updated int64
 
-	err := rows.Scan(&j.ID, &j.VendorID, &j.Event,
+	err := rows.Scan(&j.ID, &j.VendorID, &j.Event, &j.BizID,
 		&j.URL, &j.Method, &headersStr, &j.Body, &status,
 		&j.RetryCount, &j.MaxRetries, &nextRetry, &j.LastError, &created, &updated)
 	if err != nil {
@@ -536,6 +560,31 @@ func scanVendorFromRows(rows *sql.Rows) (*model.VendorConfig, error) {
 	v.CreatedAt = time.Unix(created, 0).UTC()
 	v.UpdatedAt = time.Unix(updated, 0).UTC()
 	return &v, nil
+}
+
+// SeedDefaultVendors inserts built-in vendor configurations on first startup.
+// Uses INSERT OR IGNORE so manually-modified vendors are never overwritten.
+func (s *Store) SeedDefaultVendors() error {
+	vendors := []struct {
+		id, name, baseURL string
+	}{
+		{"ad_system", "广告系统", "https://example.com/ad/callback"},
+		{"crm_system", "CRM 系统", "https://example.com/crm/webhook"},
+		{"inventory_system", "库存系统", "https://example.com/inventory/webhook"},
+	}
+
+	now := time.Now().Unix()
+	for _, v := range vendors {
+		_, err := s.db.Exec(
+			`INSERT OR IGNORE INTO vendors (id, name, base_url, method, auth_type, auth_config, headers, body_tpl, max_retries, is_active, created_at, updated_at)
+			 VALUES (?, ?, ?, 'POST', '', '{}', '{}', '', 3, 1, ?, ?)`,
+			v.id, v.name, v.baseURL, now, now,
+		)
+		if err != nil {
+			return fmt.Errorf("seed vendor %q: %w", v.id, err)
+		}
+	}
+	return nil
 }
 
 func nonNilMap(m map[string]string) map[string]string {

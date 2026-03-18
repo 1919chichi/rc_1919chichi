@@ -37,10 +37,13 @@ func main() {
 		// %v 是 Go 的格式化占位符，类似 printf 的 %s，但可以打印任意类型
 		log.Fatalf("failed to init store: %v", err)
 	}
-	// defer 关键字：延迟执行，在当前函数（main）返回时才会执行
-	// 这里确保程序退出前关闭数据库连接，避免资源泄漏
 	defer db.Close()
 	log.Printf("database initialized at %s", dbPath)
+
+	if err := db.SeedDefaultVendors(); err != nil {
+		log.Fatalf("failed to seed vendors: %v", err)
+	}
+	log.Println("default vendors seeded")
 
 	// context.WithCancel 创建一个可取消的上下文（context）
 	// ctx 用于通知所有 goroutine "该停止了"

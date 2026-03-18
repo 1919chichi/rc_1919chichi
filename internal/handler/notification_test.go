@@ -54,9 +54,9 @@ func TestHandleNotificationByID_StrictPath(t *testing.T) {
 	}
 }
 
-func TestCreate_RequiresVendorIDAndEvent(t *testing.T) {
+func TestCreate_RequiresVendorIDEventAndBizID(t *testing.T) {
 	mux, _ := newTestHandler(t)
-	body := []byte(`{"vendor_id":"","event":""}`)
+	body := []byte(`{"vendor_id":"","event":"","biz_id":""}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/notifications", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -70,7 +70,7 @@ func TestCreate_ResolvesVendorAndCreatesJob(t *testing.T) {
 	mux, s := newTestHandler(t)
 	seedVendor(t, s)
 
-	body := []byte(`{"vendor_id":"test_vendor","event":"user_registered","payload":{"user_id":123}}`)
+	body := []byte(`{"vendor_id":"test_vendor","event":"user_registered","biz_id":"user_123","payload":{"user_id":123}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/notifications", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -84,6 +84,7 @@ func TestCreate_ResolvesVendorAndCreatesJob(t *testing.T) {
 		Job struct {
 			VendorID string `json:"vendor_id"`
 			Event    string `json:"event"`
+			BizID    string `json:"biz_id"`
 			URL      string `json:"url"`
 			Method   string `json:"method"`
 		} `json:"job"`
@@ -97,6 +98,9 @@ func TestCreate_ResolvesVendorAndCreatesJob(t *testing.T) {
 	if resp.Job.Event != "user_registered" {
 		t.Fatalf("expected event %q, got %q", "user_registered", resp.Job.Event)
 	}
+	if resp.Job.BizID != "user_123" {
+		t.Fatalf("expected biz_id %q, got %q", "user_123", resp.Job.BizID)
+	}
 	if resp.Job.URL != "https://example.com/hook" {
 		t.Fatalf("expected url from vendor config, got %q", resp.Job.URL)
 	}
@@ -105,9 +109,34 @@ func TestCreate_ResolvesVendorAndCreatesJob(t *testing.T) {
 	}
 }
 
+func TestCreate_IdempotentDuplicate(t *testing.T) {
+	mux, s := newTestHandler(t)
+	seedVendor(t, s)
+
+	body := []byte(`{"vendor_id":"test_vendor","event":"user_registered","biz_id":"user_456","payload":{"user_id":456}}`)
+
+	// First request → 202
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("first: expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Second request with same biz_id → 200
+	req = httptest.NewRequest(http.MethodPost, "/api/notifications", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second: expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestCreate_RejectsUnknownVendor(t *testing.T) {
 	mux, _ := newTestHandler(t)
-	body := []byte(`{"vendor_id":"nonexistent","event":"test"}`)
+	body := []byte(`{"vendor_id":"nonexistent","event":"test","biz_id":"biz_1"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/notifications", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

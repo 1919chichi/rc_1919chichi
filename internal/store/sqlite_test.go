@@ -22,9 +22,10 @@ func newTestStore(t *testing.T) *Store {
 func TestFetchPendingJobs_ReclaimsStaleProcessing(t *testing.T) {
 	s := newTestStore(t)
 
-	created, err := s.CreateJob(model.CreateJobParams{
+	created, _, err := s.CreateJob(model.CreateJobParams{
 		VendorID: "test_vendor",
 		Event:    "user_registered",
+		BizID:    "user_001",
 		URL:      "https://example.com/hook",
 		Method:   "POST",
 	})
@@ -74,9 +75,10 @@ func TestFetchPendingJobs_ReclaimsStaleProcessing(t *testing.T) {
 func TestGetJob_InvalidHeaderJSONFallsBackToEmptyMap(t *testing.T) {
 	s := newTestStore(t)
 
-	created, err := s.CreateJob(model.CreateJobParams{
+	created, _, err := s.CreateJob(model.CreateJobParams{
 		VendorID: "test_vendor",
 		Event:    "test_event",
+		BizID:    "biz_001",
 		URL:      "https://example.com/hook",
 		Method:   "POST",
 	})
@@ -100,9 +102,10 @@ func TestGetJob_InvalidHeaderJSONFallsBackToEmptyMap(t *testing.T) {
 func TestCreateJob_StoresVendorIDAndEvent(t *testing.T) {
 	s := newTestStore(t)
 
-	job, err := s.CreateJob(model.CreateJobParams{
+	job, isNew, err := s.CreateJob(model.CreateJobParams{
 		VendorID:   "ad_system",
 		Event:      "conversion",
+		BizID:      "click_12345",
 		URL:        "https://ads.example.com/track",
 		Method:     "POST",
 		Headers:    map[string]string{"X-Api-Key": "abc"},
@@ -112,6 +115,9 @@ func TestCreateJob_StoresVendorIDAndEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
+	if !isNew {
+		t.Fatal("expected isNew to be true for first insert")
+	}
 
 	if job.VendorID != "ad_system" {
 		t.Fatalf("expected vendor_id %q, got %q", "ad_system", job.VendorID)
@@ -119,8 +125,71 @@ func TestCreateJob_StoresVendorIDAndEvent(t *testing.T) {
 	if job.Event != "conversion" {
 		t.Fatalf("expected event %q, got %q", "conversion", job.Event)
 	}
+	if job.BizID != "click_12345" {
+		t.Fatalf("expected biz_id %q, got %q", "click_12345", job.BizID)
+	}
 	if job.MaxRetries != 5 {
 		t.Fatalf("expected max_retries 5, got %d", job.MaxRetries)
+	}
+}
+
+func TestCreateJob_Idempotent(t *testing.T) {
+	s := newTestStore(t)
+
+	params := model.CreateJobParams{
+		VendorID: "ad_system",
+		Event:    "user_registered",
+		BizID:    "user_10086",
+		URL:      "https://ads.example.com/callback",
+		Method:   "POST",
+		Body:     `{"user_id":10086}`,
+	}
+
+	first, isNew, err := s.CreateJob(params)
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if !isNew {
+		t.Fatal("expected first insert to be new")
+	}
+
+	second, isNew, err := s.CreateJob(params)
+	if err != nil {
+		t.Fatalf("second create: %v", err)
+	}
+	if isNew {
+		t.Fatal("expected second insert to be duplicate")
+	}
+	if second.ID != first.ID {
+		t.Fatalf("expected same job id %d, got %d", first.ID, second.ID)
+	}
+}
+
+func TestSeedDefaultVendors(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.SeedDefaultVendors(); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	vendors, err := s.ListVendors()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(vendors) != 3 {
+		t.Fatalf("expected 3 seeded vendors, got %d", len(vendors))
+	}
+
+	// calling again should not duplicate
+	if err := s.SeedDefaultVendors(); err != nil {
+		t.Fatalf("re-seed: %v", err)
+	}
+	vendors, err = s.ListVendors()
+	if err != nil {
+		t.Fatalf("list after re-seed: %v", err)
+	}
+	if len(vendors) != 3 {
+		t.Fatalf("expected 3 vendors after re-seed, got %d", len(vendors))
 	}
 }
 

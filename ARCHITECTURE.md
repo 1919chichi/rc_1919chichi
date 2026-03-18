@@ -10,12 +10,13 @@
 
 | 能力 | 说明 |
 |------|------|
-| 异步解耦 | 业务系统提交后立即返回 `202 Accepted`，投递在后台执行 |
+| 异步解耦 | 业务系统提交后立即返回 `202 Accepted`（重复提交返回 `200 OK`），投递在后台执行 |
 | 可靠投递 | SQLite 持久化，进程重启不丢任务 |
 | 失败重试 | 指数退避策略（10s → 30s → 90s），避免瞬时压垮外部系统 |
 | 崩溃恢复 | `processing` 状态超时自动回收，保证无任务遗漏 |
 | 死信与重放 | 超过重试上限后保留现场，支持手动重放 |
-| Vendor 管理 | 集中管理外部供应商配置（URL、认证、模板），业务方只需指定 `vendor_id` + `event` |
+| Vendor 管理 | 集中管理外部供应商配置（URL、认证、模板），业务方只需指定 `vendor_id` + `event` + `biz_id` |
+| 幂等去重 | 通过 `biz_id` 业务标识实现提交侧去重，相同请求不会创建重复 Job |
 
 ### 技术栈
 
@@ -92,7 +93,10 @@
 │   │   ├── sqlite.go                # SQLite 持久化（Job + Vendor）
 │   │   └── sqlite_test.go           # Store 单元测试
 │   ├── vendor/
-│   │   └── registry.go              # Vendor 注册表与适配器接口
+│   │   ├── adapter.go               # VendorAdapter 接口与 ResolvedRequest 定义
+│   │   ├── config_adapter.go        # 配置驱动适配器（模板渲染 + 认证注入）
+│   │   ├── registry.go              # Vendor 注册表（代码 Adapter 优先，配置兜底）
+│   │   └── vendor_test.go           # Vendor 适配器单元测试
 │   └── worker/
 │       └── dispatcher.go            # 后台轮询调度与 HTTP 投递
 ├── README.md
@@ -103,12 +107,14 @@
 ### 包依赖关系
 
 ```
-main ──→ handler ──→ vendor ──→ store ──→ model
-  │                              ↑
-  └──→ worker ───────────────────┘
+main ──→ handler ──→ vendor ──→ model
+  │         │                    ↑
+  │         └──→ store ──────────┘
+  │               ↑
+  └──→ worker ────┘
 ```
 
-`handler` 在创建通知时调用 `vendor.Registry` 解析供应商配置、构建 HTTP 请求，然后通过 `store` 持久化。所有业务代码放在 `internal/` 下，Go 编译器保证外部项目无法导入，实现包级封装。
+`handler` 在创建通知时调用 `vendor.Registry` 解析供应商配置、构建 HTTP 请求，然后通过 `store` 持久化。`vendor` 包通过 `VendorStore` 接口与 `store` 解耦，只依赖 `model`，由 `main.go` 在组装时注入具体实现。所有业务代码放在 `internal/` 下，Go 编译器保证外部项目无法导入，实现包级封装。
 
 ---
 
@@ -122,7 +128,7 @@ type VendorConfig struct {
     Name       string            // 供应商显示名称
     BaseURL    string            // 投递目标 URL
     Method     string            // HTTP 方法（默认 POST）
-    AuthType   string            // 认证类型（如 "bearer", "basic", ""）
+    AuthType   string            // 认证类型（如 "bearer", "api_key", "basic", ""）
     AuthConfig map[string]string // 认证配置（如 {"token": "xxx"}）
     Headers    map[string]string // 默认请求头
     BodyTpl    string            // 请求体模板（Go text/template 语法）
@@ -133,7 +139,7 @@ type VendorConfig struct {
 }
 ```
 
-`VendorConfig` 集中管理外部供应商的投递配置。业务方创建通知时只需指定 `vendor_id`，系统自动从配置中解析出完整的 HTTP 请求参数。`BodyTpl` 支持 Go 模板语法，可在模板中引用 `.Event` 和 `.Payload` 变量。
+`VendorConfig` 集中管理外部供应商的投递配置。业务方创建通知时只需指定 `vendor_id`，系统自动从配置中解析出完整的 HTTP 请求参数。`BodyTpl` 支持 Go 模板语法，可在模板中引用 `.Event`、`.Payload` 和 `.Timestamp`（UTC RFC3339 格式）变量。
 
 ### 4.2 Job 结构
 
@@ -142,6 +148,7 @@ type Job struct {
     ID          int64             // 主键，自增
     VendorID    string            // 关联的供应商 ID
     Event       string            // 业务事件名称（如 "user_registered"）
+    BizID       string            // 业务去重标识（vendor_id + event + biz_id 唯一）
     URL         string            // 投递目标 URL（由 Vendor 解析得到）
     Method      string            // HTTP 方法（由 Vendor 解析得到）
     Headers     map[string]string // 请求头（由 Vendor 解析得到）
@@ -156,7 +163,7 @@ type Job struct {
 }
 ```
 
-与之前的区别：`VendorID` 和 `Event` 是本次新增的字段，用于记录任务来源，便于按供应商/事件维度查询和追溯。`URL`、`Method`、`Headers`、`Body` 不再由调用方直接指定，而是通过 Vendor 适配器自动构建。
+`BizID` 是调用方传入的业务去重标识，与 `VendorID` + `Event` 组成唯一键，实现幂等投递——相同业务请求重复提交时返回已有 Job 而非创建新记录。`URL`、`Method`、`Headers`、`Body` 不再由调用方直接指定，而是通过 Vendor 适配器自动构建。
 
 ### 4.3 CreateNotificationRequest（创建通知请求体）
 
@@ -164,11 +171,12 @@ type Job struct {
 type CreateNotificationRequest struct {
     VendorID string         `json:"vendor_id"` // 供应商 ID（必填）
     Event    string         `json:"event"`     // 业务事件名称（必填）
+    BizID    string         `json:"biz_id"`    // 业务去重标识（必填）
     Payload  map[string]any `json:"payload"`   // 事件负载数据（传入模板渲染）
 }
 ```
 
-调用方不再需要关心目标 URL、HTTP 方法、认证头等细节——这些全部由 Vendor 配置和适配器负责组装。
+调用方不再需要关心目标 URL、HTTP 方法、认证头等细节——这些全部由 Vendor 配置和适配器负责组装。`biz_id` 用于幂等去重，相同的 `(vendor_id, event, biz_id)` 组合不会创建重复 Job。
 
 ### 4.4 CreateJobParams（内部参数，handler → store）
 
@@ -176,6 +184,7 @@ type CreateNotificationRequest struct {
 type CreateJobParams struct {
     VendorID   string
     Event      string
+    BizID      string            // 业务去重标识
     URL        string            // 由 Vendor 适配器解析
     Method     string            // 由 Vendor 适配器解析
     Headers    map[string]string // 由 Vendor 适配器解析
@@ -233,7 +242,7 @@ type CreateJobParams struct {
 
 | 方法 | 路径 | 说明 | 响应码 |
 |------|------|------|--------|
-| `POST` | `/api/notifications` | 创建通知任务 | `202` / `400` |
+| `POST` | `/api/notifications` | 创建通知任务（幂等） | `202` / `200` / `400` |
 | `GET` | `/api/notifications/{id}` | 查询单个任务 | `200` / `404` |
 | `GET` | `/api/notifications/failed` | 列出所有失败任务 | `200` |
 | `POST` | `/api/notifications/{id}/replay` | 重放失败任务 | `200` / `400` |
@@ -246,7 +255,7 @@ type CreateJobParams struct {
 
 ### 5.2 创建通知（核心接口）
 
-调用方只需指定 `vendor_id`、`event` 和可选的 `payload`，系统自动通过 Vendor 适配器构建完整的 HTTP 请求。
+调用方只需指定 `vendor_id`、`event`、`biz_id` 和可选的 `payload`，系统自动通过 Vendor 适配器构建完整的 HTTP 请求。接口支持幂等：相同 `(vendor_id, event, biz_id)` 组合的重复请求不会创建新 Job，而是返回已有记录。
 
 **请求**
 
@@ -257,6 +266,7 @@ Content-Type: application/json
 {
   "vendor_id": "crm_vendor",
   "event": "user_registered",
+  "biz_id": "user_123",
   "payload": {
     "user_id": 123,
     "name": "Alice"
@@ -264,7 +274,7 @@ Content-Type: application/json
 }
 ```
 
-**响应**
+**响应（首次创建）**
 
 ```json
 HTTP/1.1 202 Accepted
@@ -275,9 +285,24 @@ HTTP/1.1 202 Accepted
     "id": 1,
     "vendor_id": "crm_vendor",
     "event": "user_registered",
+    "biz_id": "user_123",
     "url": "https://crm.example.com/api",
     "method": "POST",
     "status": "pending",
+    ...
+  }
+}
+```
+
+**响应（重复请求）**
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "message": "duplicate notification, returning existing job",
+  "job": {
+    "id": 1,
     ...
   }
 }
@@ -330,6 +355,7 @@ Content-Type: application/json
 | 单对象 | 请求体只能包含一个 JSON 对象 |
 | vendor_id | 必填，必须对应已存在的活跃供应商 |
 | event | 必填 |
+| biz_id | 必填，业务去重标识（与 vendor_id + event 组成唯一键） |
 
 **Vendor 管理接口**
 
@@ -420,6 +446,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     vendor_id     TEXT    NOT NULL DEFAULT '',          -- 关联的供应商 ID
     event         TEXT    NOT NULL DEFAULT '',          -- 业务事件名称
+    biz_id        TEXT    NOT NULL DEFAULT '',          -- 业务去重标识
     url           TEXT    NOT NULL,
     method        TEXT    NOT NULL DEFAULT 'POST',
     headers       TEXT    NOT NULL DEFAULT '{}',       -- JSON 格式
@@ -459,10 +486,11 @@ CREATE TABLE IF NOT EXISTS vendors (
 |------|-----|------|
 | `idx_jobs_status_next_retry` | `(status, next_retry_at)` | Worker 轮询查询优化 |
 | `idx_jobs_status_updated_at` | `(status, updated_at)` | 崩溃恢复查询 + 失败列表排序 |
+| `idx_jobs_biz_key` (UNIQUE) | `(vendor_id, event, biz_id) WHERE biz_id != ''` | 幂等去重（部分索引，空 biz_id 不参与） |
 
 ### 7.3 向后兼容迁移
 
-对于已有的 `jobs` 表，`migrate()` 通过 `ALTER TABLE` 追加 `vendor_id` 和 `event` 列（`DEFAULT ''`），忽略"列已存在"的错误，确保存量数据不受影响。
+对于已有的 `jobs` 表，`migrate()` 通过 `ALTER TABLE` 追加 `vendor_id`、`event` 和 `biz_id` 列（`DEFAULT ''`），忽略"列已存在"的错误，确保存量数据不受影响。同时创建 `idx_jobs_biz_key` 唯一部分索引用于幂等去重。
 
 ### 7.4 设计决策
 
@@ -474,6 +502,9 @@ CREATE TABLE IF NOT EXISTS vendors (
 | `_busy_timeout=5000` | 数据库锁等待 5 秒，避免 `SQLITE_BUSY` 错误 |
 | vendors.id 用 TEXT 主键 | 语义化标识（如 `"crm"`, `"ad_system"`），比自增 ID 更直观 |
 | 软删除（is_active） | 停用供应商后保留历史配置，已创建的 Job 仍可追溯 |
+| biz_id 幂等去重 | 通过 `(vendor_id, event, biz_id)` 唯一索引在数据库层面保证幂等，INSERT 冲突时返回已有记录 |
+| 部分索引（`WHERE biz_id != ''`） | 空 biz_id 的存量数据不参与唯一约束，向后兼容 |
+| 默认供应商预置（SeedDefaultVendors） | 首次启动时 INSERT OR IGNORE 内置供应商，手动修改后不会被覆盖 |
 
 ---
 
@@ -527,7 +558,9 @@ CREATE TABLE IF NOT EXISTS vendors (
 ```
 main()
   │
-  ├─ 1. store.New(dbPath)              初始化 SQLite，执行 migration（含 vendors 表）
+  ├─ 1. store.New(dbPath)              初始化 SQLite，执行 migration（含 vendors 表 + biz_id 列）
+  │
+  ├─ 1.5 db.SeedDefaultVendors()      预置内置供应商（INSERT OR IGNORE，不覆盖已有）
   │
   ├─ 2. vendor.NewRegistry(db)         创建 Vendor 注册表（从 DB 加载配置）
   │
@@ -573,7 +606,7 @@ main()
 
 | 层 | 策略 |
 |----|------|
-| **handler** | 返回结构化 JSON 错误响应，区分 `400`/`404`/`405`/`500`；Vendor 不存在时返回 `400` |
+| **handler** | 返回结构化 JSON 错误响应，区分 `400`/`404`/`405`/`500`；Vendor 不存在时返回 `400`；重复提交返回 `200` |
 | **vendor** | 适配器构建失败时返回 error，由 handler 转为 `500` 响应 |
 | **store** | 用 `fmt.Errorf("%w")` 包装错误向上传播，JSON 解析容错返回空 map |
 | **worker** | 日志记录 + 状态流转（MarkRetry / MarkFailed），不 panic |
@@ -585,8 +618,9 @@ main()
 
 | 文件 | 测试内容 |
 |------|----------|
-| `handler/notification_test.go` | 路由严格匹配（404）、vendor_id/event 必填校验、Vendor 解析并创建 Job、拒绝未知 Vendor、拒绝未知 JSON 字段、Vendor CRUD 全流程 |
-| `store/sqlite_test.go` | 超时 processing 任务回收、无效 Headers JSON 容错、CreateJob 存储 vendor_id/event、Vendor CRUD（创建/查询/列表/更新/软删除） |
+| `handler/notification_test.go` | 路由严格匹配（404）、vendor_id/event/biz_id 必填校验、Vendor 解析并创建 Job（含 biz_id）、幂等去重（202→200）、拒绝未知 Vendor、拒绝未知 JSON 字段、Vendor CRUD 全流程 |
+| `store/sqlite_test.go` | 超时 processing 任务回收、无效 Headers JSON 容错、CreateJob 存储 vendor_id/event/biz_id、CreateJob 幂等去重、SeedDefaultVendors 预置与重复调用安全、Vendor CRUD（创建/查询/列表/更新/软删除） |
+| `vendor/vendor_test.go` | ConfigAdapter 模板渲染、认证注入（bearer/api_key/basic）、Registry 解析优先级（代码 Adapter > 配置）、异常处理 |
 
 测试使用临时数据库文件，每个测试用例独立初始化，确保隔离性。Handler 测试通过 `seedVendor` 辅助函数预置供应商配置，模拟完整的"配置 Vendor → 创建通知"流程。
 

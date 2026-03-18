@@ -114,9 +114,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 
 	req.VendorID = strings.TrimSpace(req.VendorID)
 	req.Event = strings.TrimSpace(req.Event)
+	req.BizID = strings.TrimSpace(req.BizID)
 
-	if req.VendorID == "" || req.Event == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "vendor_id and event are required"})
+	if req.VendorID == "" || req.Event == "" || req.BizID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "vendor_id, event and biz_id are required"})
 		return
 	}
 
@@ -132,9 +133,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, err := h.store.CreateJob(model.CreateJobParams{
+	job, isNew, err := h.store.CreateJob(model.CreateJobParams{
 		VendorID:   req.VendorID,
 		Event:      req.Event,
+		BizID:      req.BizID,
 		URL:        resolved.URL,
 		Method:     resolved.Method,
 		Headers:    resolved.Headers,
@@ -146,10 +148,17 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"message": "notification enqueued",
-		"job":     job,
-	})
+	if isNew {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"message": "notification enqueued",
+			"job":     job,
+		})
+	} else {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"message": "duplicate notification, returning existing job",
+			"job":     job,
+		})
+	}
 }
 
 func (h *Handler) Get(w http.ResponseWriter, _ *http.Request, id int64) {

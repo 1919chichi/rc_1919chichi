@@ -29,6 +29,7 @@ type Job struct {
 	ID          int64             `json:"id"`
 	VendorID    string            `json:"vendor_id"`
 	Event       string            `json:"event"`
+	BizID       string            `json:"biz_id"`
 	URL         string            `json:"url"`
 	Method      string            `json:"method"`
 	Headers     map[string]string `json:"headers,omitempty"`
@@ -47,6 +48,7 @@ type Job struct {
 type CreateNotificationRequest struct {
 	VendorID string         `json:"vendor_id"`
 	Event    string         `json:"event"`
+	BizID    string         `json:"biz_id"`
 	Payload  map[string]any `json:"payload,omitempty"`
 }
 
