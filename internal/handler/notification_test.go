@@ -99,25 +99,25 @@ func TestCreate_ResolvesVendorAndCreatesJob(t *testing.T) {
 		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	var job model.Job
-	resp := decodeResponse(t, rec.Body.Bytes(), &job)
+	var data model.NotificationResponse
+	resp := decodeResponse(t, rec.Body.Bytes(), &data)
 	if resp.Code != 0 {
 		t.Fatalf("expected code 0, got %d", resp.Code)
 	}
-	if job.VendorID != "test_vendor" {
-		t.Fatalf("expected vendor_id %q, got %q", "test_vendor", job.VendorID)
+	if data.VendorID != "test_vendor" {
+		t.Fatalf("expected vendor_id %q, got %q", "test_vendor", data.VendorID)
 	}
-	if job.Event != "user_registered" {
-		t.Fatalf("expected event %q, got %q", "user_registered", job.Event)
+	if data.Event != "user_registered" {
+		t.Fatalf("expected event %q, got %q", "user_registered", data.Event)
 	}
-	if job.BizID != "user_123" {
-		t.Fatalf("expected biz_id %q, got %q", "user_123", job.BizID)
+	if data.BizID != "user_123" {
+		t.Fatalf("expected biz_id %q, got %q", "user_123", data.BizID)
 	}
-	if job.URL != "https://example.com/hook" {
-		t.Fatalf("expected url from vendor config, got %q", job.URL)
+	if data.Status != string(model.StatusPending) {
+		t.Fatalf("expected status pending, got %q", data.Status)
 	}
-	if job.Method != "POST" {
-		t.Fatalf("expected method POST, got %q", job.Method)
+	if data.ID <= 0 || data.CreatedAt <= 0 || data.UpdatedAt <= 0 {
+		t.Fatalf("expected id and timestamps set, got id=%d created_at=%d updated_at=%d", data.ID, data.CreatedAt, data.UpdatedAt)
 	}
 }
 

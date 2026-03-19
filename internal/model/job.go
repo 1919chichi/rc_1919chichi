@@ -52,6 +52,30 @@ type CreateNotificationRequest struct {
 	Payload  map[string]any `json:"payload,omitempty"`
 }
 
+// NotificationResponse 面向业务方的通知结果，仅包含业务相关字段，时间为 Unix 时间戳
+type NotificationResponse struct {
+	ID        int64  `json:"id"`
+	VendorID  string `json:"vendor_id"`
+	Event     string `json:"event"`
+	BizID     string `json:"biz_id"`
+	Status    string `json:"status"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+// ToNotificationResponse 将 Job 转为面向业务方的精简响应（时间为时间戳）
+func (j *Job) ToNotificationResponse() NotificationResponse {
+	return NotificationResponse{
+		ID:        j.ID,
+		VendorID:  j.VendorID,
+		Event:     j.Event,
+		BizID:     j.BizID,
+		Status:    string(j.Status),
+		CreatedAt: j.CreatedAt.Unix(),
+		UpdatedAt: j.UpdatedAt.Unix(),
+	}
+}
+
 // BackoffDuration 计算指数退避的等待时间
 // func 函数名(参数名 参数类型) 返回值类型 —— Go 的函数签名格式
 // retry 0 -> 10秒, retry 1 -> 30秒, retry 2 -> 90秒, ...（每次乘以3）

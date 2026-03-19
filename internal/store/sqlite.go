@@ -55,6 +55,7 @@ func (s *Store) Close() error {
 // 小写字母开头的函数/方法是私有的（unexported），只能在包内访问
 // 大写字母开头的才是公开的（exported），类似其他语言的 public/private
 func (s *Store) migrate() error {
+	// 1. 创建表（若已存在则跳过；旧版 jobs 表可能缺少 vendor_id/event/biz_id）
 	query := `
 	CREATE TABLE IF NOT EXISTS jobs (
 		id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +76,6 @@ func (s *Store) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_jobs_status_next_retry ON jobs(status, next_retry_at);
 	CREATE INDEX IF NOT EXISTS idx_jobs_status_updated_at ON jobs(status, updated_at);
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_biz_key ON jobs(vendor_id, event, biz_id) WHERE biz_id != '';
 
 	CREATE TABLE IF NOT EXISTS vendors (
 		id          TEXT PRIMARY KEY,
@@ -96,20 +96,28 @@ func (s *Store) migrate() error {
 		return err
 	}
 
+	// 2. 为旧版 jobs 表追加 vendor_id/event/biz_id 列
+	// 列已存在时 SQLite 报 "duplicate column name"，忽略即可；其他错误需返回
 	for _, q := range []string{
 		"ALTER TABLE jobs ADD COLUMN vendor_id TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE jobs ADD COLUMN event TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE jobs ADD COLUMN biz_id TEXT NOT NULL DEFAULT ''",
 	} {
-		s.db.Exec(q)
+		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("alter jobs: %w", err)
+		}
 	}
-	s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_biz_key ON jobs(vendor_id, event, biz_id) WHERE biz_id != ''`)
+
+	// 3. 创建依赖 vendor_id/event/biz_id 的唯一索引（必须在 ALTER 之后）
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_biz_key ON jobs(vendor_id, event, biz_id) WHERE biz_id != ''`); err != nil {
+		return err
+	}
 	return nil
 }
 
-// CreateJob persists a fully-resolved notification job.
-// Returns (job, isNew, error). When an identical biz_key already exists,
-// isNew is false and the existing job is returned without creating a duplicate.
+// CreateJob 持久化一个已解析好的通知任务。
+// 返回 (job, isNew, error)。当相同 biz_key 已存在时，isNew 为 false，
+// 直接返回已有任务，不创建重复记录（实现业务去重）。
 func (s *Store) CreateJob(p model.CreateJobParams) (*model.Job, bool, error) {
 	headers := p.Headers
 	if headers == nil {
@@ -272,6 +280,7 @@ func (s *Store) FetchPendingJobs(limit int, processingTimeout time.Duration) ([]
 	return jobs, nil
 }
 
+// GetJob 按主键 ID 查询单个任务
 func (s *Store) GetJob(id int64) (*model.Job, error) {
 	row := s.db.QueryRow(
 		`SELECT id, vendor_id, event, biz_id, url, method, headers, body, status,
@@ -280,7 +289,7 @@ func (s *Store) GetJob(id int64) (*model.Job, error) {
 	return scanJob(row)
 }
 
-// GetJobByBizKey finds an existing job by its business dedup key.
+// GetJobByBizKey 按业务去重键 (vendor_id, event, biz_id) 查询已有任务
 func (s *Store) GetJobByBizKey(vendorID, event, bizID string) (*model.Job, error) {
 	row := s.db.QueryRow(
 		`SELECT id, vendor_id, event, biz_id, url, method, headers, body, status,
@@ -320,6 +329,7 @@ func (s *Store) MarkFailed(id int64, lastError string) error {
 	return err
 }
 
+// ListFailedJobs 列出所有最终失败的任务，按更新时间倒序，用于人工排查或重放
 func (s *Store) ListFailedJobs() ([]model.Job, error) {
 	rows, err := s.db.Query(
 		`SELECT id, vendor_id, event, biz_id, url, method, headers, body, status,
@@ -369,6 +379,7 @@ type scannable interface {
 	Scan(dest ...any) error // ...any 表示接受任意数量、任意类型的参数
 }
 
+// scanJob 从满足 scannable 接口的行中解析出 Job 结构体
 func scanJob(row scannable) (*model.Job, error) {
 	var j model.Job
 	var headersStr, status string
@@ -389,6 +400,7 @@ func scanJob(row scannable) (*model.Job, error) {
 	return &j, nil
 }
 
+// scanJobFromRows 从多行结果集中的当前行扫描为 model.Job（与 scanJob 逻辑相同，参数类型不同）
 func scanJobFromRows(rows *sql.Rows) (*model.Job, error) {
 	var j model.Job
 	var headersStr, status string
@@ -409,8 +421,9 @@ func scanJobFromRows(rows *sql.Rows) (*model.Job, error) {
 	return &j, nil
 }
 
-// --------------- Vendor CRUD ---------------
+// --------------- Vendor CRUD（厂商配置增删改查）---------------
 
+// GetVendor 按 ID 获取单个厂商配置
 func (s *Store) GetVendor(id string) (*model.VendorConfig, error) {
 	row := s.db.QueryRow(
 		`SELECT id, name, base_url, method, auth_type, auth_config, headers,
@@ -419,6 +432,7 @@ func (s *Store) GetVendor(id string) (*model.VendorConfig, error) {
 	return scanVendor(row)
 }
 
+// ListVendors 列出所有厂商配置，按创建时间倒序
 func (s *Store) ListVendors() ([]model.VendorConfig, error) {
 	rows, err := s.db.Query(
 		`SELECT id, name, base_url, method, auth_type, auth_config, headers,
@@ -440,6 +454,7 @@ func (s *Store) ListVendors() ([]model.VendorConfig, error) {
 	return vendors, nil
 }
 
+// CreateVendor 创建新厂商配置
 func (s *Store) CreateVendor(req model.CreateVendorRequest) (*model.VendorConfig, error) {
 	authCfg, err := json.Marshal(nonNilMap(req.AuthConfig))
 	if err != nil {
@@ -472,6 +487,7 @@ func (s *Store) CreateVendor(req model.CreateVendorRequest) (*model.VendorConfig
 	return s.GetVendor(req.ID)
 }
 
+// UpdateVendor 更新已有厂商配置
 func (s *Store) UpdateVendor(id string, req model.UpdateVendorRequest) (*model.VendorConfig, error) {
 	authCfg, err := json.Marshal(nonNilMap(req.AuthConfig))
 	if err != nil {
@@ -508,6 +524,7 @@ func (s *Store) UpdateVendor(id string, req model.UpdateVendorRequest) (*model.V
 	return s.GetVendor(id)
 }
 
+// DeleteVendor 软删除厂商：将 is_active 设为 0，保留历史数据
 func (s *Store) DeleteVendor(id string) error {
 	now := time.Now().Unix()
 	result, err := s.db.Exec(
@@ -562,8 +579,8 @@ func scanVendorFromRows(rows *sql.Rows) (*model.VendorConfig, error) {
 	return &v, nil
 }
 
-// SeedDefaultVendors inserts built-in vendor configurations on first startup.
-// Uses INSERT OR IGNORE so manually-modified vendors are never overwritten.
+// SeedDefaultVendors 首次启动时插入内置厂商配置（广告、CRM、库存系统）。
+// 使用 INSERT OR IGNORE，已存在的记录不会被覆盖，用户手动修改的配置得以保留。
 func (s *Store) SeedDefaultVendors() error {
 	vendors := []struct {
 		id, name, baseURL string
@@ -587,6 +604,7 @@ func (s *Store) SeedDefaultVendors() error {
 	return nil
 }
 
+// nonNilMap 确保 map 非 nil，避免 json.Marshal(nil) 序列化异常
 func nonNilMap(m map[string]string) map[string]string {
 	if m == nil {
 		return map[string]string{}

@@ -869,9 +869,9 @@ HTTP/1.1 200 OK
 业务系统              HTTP API             Vendor Registry        Store (SQLite)        Worker
    │                    │                       │                      │                  │
    │  POST /api/notifications                   │                      │                  │
-   │  {vendor_id, event, payload}               │                      │                  │
+   │  {vendor_id, event, biz_id, payload}       │                      │                  │
    │───────────────────>│                       │                      │                  │
-   │                    │  校验 vendor_id/event  │                      │                  │
+   │                    │  校验 vendor_id/event/biz_id                 │                  │
    │                    │                       │                      │                  │
    │                    │  Resolve(vendor_id)    │                      │                  │
    │                    │──────────────────────>│                      │                  │

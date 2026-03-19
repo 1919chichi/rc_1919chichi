@@ -4,17 +4,18 @@ package main
 // import (...) —— 导入需要用到的包（类似 Python 的 import 或 Java 的 import）
 // Go 的标准库包用短名称（如 "log"），第三方/自己的包用完整路径
 import (
-	"context" // context 包：用于在函数之间传递"取消信号"和超时控制
-	"log"     // log 包：用于打印日志
-	"net/http" // net/http 包：Go 内置的 HTTP 服务器和客户端库
-	"os"       // os 包：操作系统相关功能（如读取环境变量）
+	"context"   // context 包：用于在函数之间传递"取消信号"和超时控制
+	"log"       // log 包：用于打印日志
+	"net/http"  // net/http 包：Go 内置的 HTTP 服务器和客户端库
+	"os"        // os 包：操作系统相关功能（如读取环境变量）
 	"os/signal" // os/signal 包：监听操作系统信号（如 Ctrl+C）
-	"syscall"   // syscall 包：提供操作系统底层信号的常量（如 SIGINT、SIGTERM）
-	"time"      // time 包：时间相关的工具
+	"path/filepath"
+	"syscall" // syscall 包：提供操作系统底层信号的常量（如 SIGINT、SIGTERM）
+	"time"    // time 包：时间相关的工具
 
+	"github.com/1919chichi/rc_1919chichi/internal/adapter"
 	"github.com/1919chichi/rc_1919chichi/internal/handler"
 	"github.com/1919chichi/rc_1919chichi/internal/store"
-	"github.com/1919chichi/rc_1919chichi/internal/adapter"
 	"github.com/1919chichi/rc_1919chichi/internal/worker"
 )
 
@@ -23,6 +24,10 @@ func main() {
 	// envOr() 是下面定义的辅助函数：读取环境变量，如果没设置就用默认值
 	// 这里读取数据库文件路径，默认为 "notifications.db"
 	dbPath := envOr("DB_PATH", "notifications.db")
+	dbPath, err := resolveDBPath(dbPath)
+	if err != nil {
+		log.Fatalf("resolve db path: %v", err)
+	}
 	// 读取监听地址，默认为 ":8080"（即监听所有网卡的 8080 端口）
 	addr := envOr("ADDR", ":8080")
 
@@ -111,4 +116,23 @@ func envOr(key, fallback string) string {
 	}
 	// 如果环境变量为空，返回默认值
 	return fallback
+}
+
+// resolveDBPath 将数据库路径解析为绝对路径。
+// 若为相对路径（如 "notifications.db"），则基于当前工作目录解析，这样在项目根执行 go run . 时 db 会落在项目根。
+// 若为绝对路径（或 DB_PATH 已设为绝对路径），则原样返回。
+func resolveDBPath(dbPath string) (string, error) {
+	if filepath.IsAbs(dbPath) {
+		return dbPath, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	resolved := filepath.Join(cwd, dbPath)
+	parent := filepath.Dir(resolved)
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		return "", err
+	}
+	return resolved, nil
 }

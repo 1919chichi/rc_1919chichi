@@ -148,10 +148,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resp := job.ToNotificationResponse()
 	if isNew {
-		respondSuccess(w, http.StatusAccepted, job)
+		respondSuccess(w, http.StatusAccepted, resp)
 	} else {
-		respondSuccess(w, http.StatusOK, job)
+		respondSuccess(w, http.StatusOK, resp)
 	}
 }
 
@@ -161,7 +162,7 @@ func (h *Handler) Get(w http.ResponseWriter, _ *http.Request, id int64) {
 		respondError(w, http.StatusNotFound, "job not found")
 		return
 	}
-	respondSuccess(w, http.StatusOK, job)
+	respondSuccess(w, http.StatusOK, job.ToNotificationResponse())
 }
 
 func (h *Handler) ListFailed(w http.ResponseWriter, _ *http.Request) {
@@ -173,7 +174,11 @@ func (h *Handler) ListFailed(w http.ResponseWriter, _ *http.Request) {
 	if jobs == nil {
 		jobs = []model.Job{}
 	}
-	respondList(w, jobs, len(jobs))
+	items := make([]model.NotificationResponse, 0, len(jobs))
+	for i := range jobs {
+		items = append(items, jobs[i].ToNotificationResponse())
+	}
+	respondList(w, items, len(items))
 }
 
 func (h *Handler) Replay(w http.ResponseWriter, _ *http.Request, id int64) {
@@ -182,7 +187,7 @@ func (h *Handler) Replay(w http.ResponseWriter, _ *http.Request, id int64) {
 		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	respondSuccess(w, http.StatusOK, job)
+	respondSuccess(w, http.StatusOK, job.ToNotificationResponse())
 }
 
 func parseJobID(raw string) (int64, error) {
