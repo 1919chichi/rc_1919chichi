@@ -13,6 +13,7 @@
 - **默认供应商预置**：AI 实现了 `SeedDefaultVendors` 方法（INSERT OR IGNORE 语义），以及启动流程中的自动调用
 - **API 响应格式分析**：我提出通知接口的返回值不符合工程规范后，AI 梳理了通知 API 与 Vendor API 的响应格式差异（Create 有无 message 包装、列表 key 不统一、Get 裸返回实体等），并给出了 3 种改进方向供我选择
 - **统一响应封装实现**：在我决定采用统一信封方案后，AI 完成了全量改造——新增 `model.Response` / `model.ListData` 结构体、`handler/response.go` 辅助函数（`respondSuccess` / `respondError` / `respondList`）、重构通知和 Vendor 全部 handler、适配测试用例、同步更新 ARCHITECTURE.md 和 README.md 文档（每个接口补充完整的请求参数表和响应参数表）
+- **通知接口返回精简与时间戳**：我提出 POST /api/notifications 等接口返回了过多内部字段（url、method、retry_count、max_retries、next_retry_at 等），业务方只关心业务相关数据，且希望时间统一为时间戳。AI 新增了面向业务方的 `model.NotificationResponse`（仅含 id、vendor_id、event、biz_id、status、created_at、updated_at），其中 created_at/updated_at 改为 Unix 时间戳（int64）；为 `model.Job` 增加 `ToNotificationResponse()` 方法；将 Create、Get、ListFailed、Replay 四个接口的 data 统一改为返回该精简结构，并更新了 `TestCreate_ResolvesVendorAndCreatesJob` 的断言以匹配新响应格式
 
 ## AI 给出过哪些我没有采纳的建议
 

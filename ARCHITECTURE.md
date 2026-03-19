@@ -167,6 +167,22 @@ type Job struct {
 
 `BizID` 是调用方传入的业务去重标识，与 `VendorID` + `Event` 组成唯一键，实现幂等投递——相同业务请求重复提交时返回已有 Job 而非创建新记录。`URL`、`Method`、`Headers`、`Body` 不再由调用方直接指定，而是通过 Vendor 适配器自动构建。
 
+### 4.2.1 NotificationResponse（通知接口统一返回体）
+
+通知相关 API（创建/查询/列表失败/重放）对外统一返回精简结构，不暴露内部投递详情（url、method、headers、body、重试次数等）：
+
+```go
+type NotificationResponse struct {
+    ID        int64  `json:"id"`
+    VendorID  string `json:"vendor_id"`
+    Event     string `json:"event"`
+    BizID     string `json:"biz_id"`
+    Status    string `json:"status"`
+    CreatedAt int64  `json:"created_at"`  // Unix 时间戳（秒）
+    UpdatedAt int64  `json:"updated_at"`  // Unix 时间戳（秒）
+}
+```
+
 ### 4.3 CreateNotificationRequest（创建通知请求体）
 
 ```go
@@ -354,23 +370,17 @@ Content-Type: application/json
 
 **响应参数（data 字段）**
 
+通知接口统一返回精简的 `NotificationResponse`，仅包含业务侧需要的字段；内部投递详情（url、method、headers、body、重试次数等）不对外暴露。
+
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `id` | `int` | Job 主键 |
 | `vendor_id` | `string` | 供应商 ID |
 | `event` | `string` | 事件名称 |
 | `biz_id` | `string` | 业务去重标识 |
-| `url` | `string` | 投递目标 URL（由 Vendor 解析） |
-| `method` | `string` | HTTP 方法（由 Vendor 解析） |
-| `headers` | `object` | 请求头（由 Vendor 解析） |
-| `body` | `string` | 请求体（由模板渲染） |
 | `status` | `string` | 任务状态：`pending` / `processing` / `completed` / `failed` |
-| `retry_count` | `int` | 已重试次数 |
-| `max_retries` | `int` | 最大重试次数 |
-| `next_retry_at` | `string` | 下次重试时间（RFC3339） |
-| `last_error` | `string` | 最近一次失败原因 |
-| `created_at` | `string` | 创建时间（RFC3339） |
-| `updated_at` | `string` | 更新时间（RFC3339） |
+| `created_at` | `int` | 创建时间（Unix 时间戳，秒） |
+| `updated_at` | `int` | 更新时间（Unix 时间戳，秒） |
 
 **响应示例（首次创建 — 202）**
 
@@ -385,16 +395,9 @@ HTTP/1.1 202 Accepted
     "vendor_id": "crm_vendor",
     "event": "user_registered",
     "biz_id": "user_123",
-    "url": "https://crm.example.com/api",
-    "method": "POST",
-    "headers": {"Content-Type": "application/json"},
-    "body": "{\"event\": \"user_registered\", \"data\": {\"user_id\":123}}",
     "status": "pending",
-    "retry_count": 0,
-    "max_retries": 3,
-    "next_retry_at": "2026-03-18T12:00:00Z",
-    "created_at": "2026-03-18T12:00:00Z",
-    "updated_at": "2026-03-18T12:00:00Z"
+    "created_at": 1710763200,
+    "updated_at": 1710763200
   }
 }
 ```
@@ -413,7 +416,8 @@ HTTP/1.1 200 OK
     "event": "user_registered",
     "biz_id": "user_123",
     "status": "pending",
-    ...
+    "created_at": 1710763200,
+    "updated_at": 1710763200
   }
 }
 ```
@@ -452,13 +456,9 @@ HTTP/1.1 200 OK
     "vendor_id": "crm_vendor",
     "event": "user_registered",
     "biz_id": "user_123",
-    "url": "https://crm.example.com/api",
-    "method": "POST",
     "status": "completed",
-    "retry_count": 0,
-    "max_retries": 3,
-    "created_at": "2026-03-18T12:00:00Z",
-    "updated_at": "2026-03-18T12:00:05Z"
+    "created_at": 1710763200,
+    "updated_at": 1710763205
   }
 }
 ```
@@ -482,7 +482,7 @@ HTTP/1.1 404 Not Found
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `items` | `Job[]` | 失败任务列表（Job 结构同 5.3.1） |
+| `items` | `NotificationResponse[]` | 失败任务列表（结构同 5.3.1 的 data） |
 | `total` | `int` | 总条数 |
 
 **响应示例**
@@ -501,10 +501,8 @@ HTTP/1.1 200 OK
         "event": "click",
         "biz_id": "click_789",
         "status": "failed",
-        "retry_count": 3,
-        "max_retries": 3,
-        "last_error": "HTTP 503 Service Unavailable",
-        ...
+        "created_at": 1710763200,
+        "updated_at": 1710763400
       }
     ],
     "total": 1
@@ -540,10 +538,8 @@ HTTP/1.1 200 OK
     "event": "click",
     "biz_id": "click_789",
     "status": "pending",
-    "retry_count": 0,
-    "max_retries": 3,
-    "last_error": "",
-    ...
+    "created_at": 1710763200,
+    "updated_at": 1710763400
   }
 }
 ```
