@@ -14,7 +14,7 @@ import (
 
 	"github.com/1919chichi/rc_1919chichi/internal/handler"
 	"github.com/1919chichi/rc_1919chichi/internal/store"
-	"github.com/1919chichi/rc_1919chichi/internal/vendor"
+	"github.com/1919chichi/rc_1919chichi/internal/adapter"
 	"github.com/1919chichi/rc_1919chichi/internal/worker"
 )
 
@@ -51,7 +51,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // 同样用 defer 确保 main 退出时取消
 
-	registry := vendor.NewRegistry(db)
+	registry := adapter.NewRegistry(db)
 	// registry.Register(myAdapter) — register code-level adapters here
 
 	dispatcher := worker.New(db)

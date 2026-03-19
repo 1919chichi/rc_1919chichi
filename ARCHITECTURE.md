@@ -46,7 +46,7 @@
 └────────┬─────────┘     │ └──────────┬──────────┘
          │               │            │
          │    ┌──────────▼─────────┐  │
-         │    │   vendor 层         │  │
+         │    │   adapter 层         │  │
          │    │  (供应商适配)        │  │
          │    │                     │  │
          │    │ • Registry 注册表   │  │
@@ -71,7 +71,7 @@
 └───────────────────────────────────────────────┘
 ```
 
-各层职责严格隔离：`handler` 和 `worker` 互不依赖，均通过 `store` 操作数据。`vendor` 层负责将业务事件映射为具体的 HTTP 请求，由 `handler` 在创建通知时调用。`model` 作为共享的数据定义层，被所有包引用。
+各层职责严格隔离：`handler` 和 `worker` 互不依赖，均通过 `store` 操作数据。`adapter` 层负责将业务事件映射为具体的 HTTP 请求，由 `handler` 在创建通知时调用。`model` 作为共享的数据定义层，被所有包引用。
 
 ---
 
@@ -92,11 +92,11 @@
 │   ├── store/
 │   │   ├── sqlite.go                # SQLite 持久化（Job + Vendor）
 │   │   └── sqlite_test.go           # Store 单元测试
-│   ├── vendor/
+│   ├── adapter/
 │   │   ├── adapter.go               # VendorAdapter 接口与 ResolvedRequest 定义
 │   │   ├── config_adapter.go        # 配置驱动适配器（模板渲染 + 认证注入）
 │   │   ├── registry.go              # Vendor 注册表（代码 Adapter 优先，配置兜底）
-│   │   └── vendor_test.go           # Vendor 适配器单元测试
+│   │   └── adapter_test.go          # Adapter 单元测试
 │   └── worker/
 │       └── dispatcher.go            # 后台轮询调度与 HTTP 投递
 ├── README.md
@@ -107,14 +107,14 @@
 ### 包依赖关系
 
 ```
-main ──→ handler ──→ vendor ──→ model
+main ──→ handler ──→ adapter ──→ model
   │         │                    ↑
   │         └──→ store ──────────┘
   │               ↑
   └──→ worker ────┘
 ```
 
-`handler` 在创建通知时调用 `vendor.Registry` 解析供应商配置、构建 HTTP 请求，然后通过 `store` 持久化。`vendor` 包通过 `VendorStore` 接口与 `store` 解耦，只依赖 `model`，由 `main.go` 在组装时注入具体实现。所有业务代码放在 `internal/` 下，Go 编译器保证外部项目无法导入，实现包级封装。
+`handler` 在创建通知时调用 `adapter.Registry` 解析供应商配置、构建 HTTP 请求，然后通过 `store` 持久化。`adapter` 包通过 `VendorStore` 接口与 `store` 解耦，只依赖 `model`，由 `main.go` 在组装时注入具体实现。所有业务代码放在 `internal/` 下，Go 编译器保证外部项目无法导入，实现包级封装。
 
 ---
 
@@ -193,7 +193,7 @@ type CreateJobParams struct {
 }
 ```
 
-`Handler.Create` 先通过 `vendor.Registry` 解析出完整的 HTTP 请求参数，再构造 `CreateJobParams` 传给 `store.CreateJob`。
+`Handler.Create` 先通过 `adapter.Registry` 解析出完整的 HTTP 请求参数，再构造 `CreateJobParams` 传给 `store.CreateJob`。
 
 ### 4.5 状态机
 
@@ -562,7 +562,7 @@ main()
   │
   ├─ 1.5 db.SeedDefaultVendors()      预置内置供应商（INSERT OR IGNORE，不覆盖已有）
   │
-  ├─ 2. vendor.NewRegistry(db)         创建 Vendor 注册表（从 DB 加载配置）
+  ├─ 2. adapter.NewRegistry(db)        创建 Vendor 注册表（从 DB 加载配置）
   │
   ├─ 3. worker.New(db)                 创建 Dispatcher
   │     └─ go dispatcher.Start(ctx)    后台 goroutine 轮询
@@ -607,7 +607,7 @@ main()
 | 层 | 策略 |
 |----|------|
 | **handler** | 返回结构化 JSON 错误响应，区分 `400`/`404`/`405`/`500`；Vendor 不存在时返回 `400`；重复提交返回 `200` |
-| **vendor** | 适配器构建失败时返回 error，由 handler 转为 `500` 响应 |
+| **adapter** | 适配器构建失败时返回 error，由 handler 转为 `500` 响应 |
 | **store** | 用 `fmt.Errorf("%w")` 包装错误向上传播，JSON 解析容错返回空 map |
 | **worker** | 日志记录 + 状态流转（MarkRetry / MarkFailed），不 panic |
 | **main** | `log.Fatalf` 处理不可恢复的初始化错误 |
@@ -620,7 +620,7 @@ main()
 |------|----------|
 | `handler/notification_test.go` | 路由严格匹配（404）、vendor_id/event/biz_id 必填校验、Vendor 解析并创建 Job（含 biz_id）、幂等去重（202→200）、拒绝未知 Vendor、拒绝未知 JSON 字段、Vendor CRUD 全流程 |
 | `store/sqlite_test.go` | 超时 processing 任务回收、无效 Headers JSON 容错、CreateJob 存储 vendor_id/event/biz_id、CreateJob 幂等去重、SeedDefaultVendors 预置与重复调用安全、Vendor CRUD（创建/查询/列表/更新/软删除） |
-| `vendor/vendor_test.go` | ConfigAdapter 模板渲染、认证注入（bearer/api_key/basic）、Registry 解析优先级（代码 Adapter > 配置）、异常处理 |
+| `adapter/adapter_test.go` | ConfigAdapter 模板渲染、认证注入（bearer/api_key/basic）、Registry 解析优先级（代码 Adapter > 配置）、异常处理 |
 
 测试使用临时数据库文件，每个测试用例独立初始化，确保隔离性。Handler 测试通过 `seedVendor` 辅助函数预置供应商配置，模拟完整的"配置 Vendor → 创建通知"流程。
 

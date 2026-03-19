@@ -10,17 +10,17 @@ import (
 
 	"github.com/1919chichi/rc_1919chichi/internal/model"
 	"github.com/1919chichi/rc_1919chichi/internal/store"
-	"github.com/1919chichi/rc_1919chichi/internal/vendor"
+	"github.com/1919chichi/rc_1919chichi/internal/adapter"
 )
 
 type Handler struct {
 	store    *store.Store
-	registry *vendor.Registry
+	registry *adapter.Registry
 }
 
 const maxRequestBodyBytes = 1 << 20 // 1 MB
 
-func New(s *store.Store, r *vendor.Registry) *Handler {
+func New(s *store.Store, r *adapter.Registry) *Handler {
 	return &Handler{store: s, registry: r}
 }
 

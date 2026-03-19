@@ -10,7 +10,7 @@ import (
 
 	"github.com/1919chichi/rc_1919chichi/internal/model"
 	"github.com/1919chichi/rc_1919chichi/internal/store"
-	"github.com/1919chichi/rc_1919chichi/internal/vendor"
+	"github.com/1919chichi/rc_1919chichi/internal/adapter"
 )
 
 func newTestHandler(t *testing.T) (*http.ServeMux, *store.Store) {
@@ -22,7 +22,7 @@ func newTestHandler(t *testing.T) (*http.ServeMux, *store.Store) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	r := vendor.NewRegistry(s)
+	r := adapter.NewRegistry(s)
 	h := New(s, r)
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
