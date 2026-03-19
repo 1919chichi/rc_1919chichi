@@ -84,9 +84,11 @@
 ├── internal/
 │   ├── model/
 │   │   ├── job.go                   # Job 模型、状态常量、退避算法
+│   │   ├── response.go              # 统一响应封装（Response / ListData）
 │   │   └── vendor.go                # VendorConfig 模型、请求/响应结构
 │   ├── handler/
 │   │   ├── notification.go          # 通知相关 HTTP API
+│   │   ├── response.go              # 统一响应辅助函数
 │   │   ├── vendor.go                # Vendor CRUD HTTP API
 │   │   └── notification_test.go     # Handler 单元测试
 │   ├── store/
@@ -195,7 +197,30 @@ type CreateJobParams struct {
 
 `Handler.Create` 先通过 `adapter.Registry` 解析出完整的 HTTP 请求参数，再构造 `CreateJobParams` 传给 `store.CreateJob`。
 
-### 4.5 状态机
+### 4.5 Response 统一响应封装
+
+```go
+type Response struct {
+    Code    int    `json:"code"`    // 业务码：0 表示成功，非 0 为 HTTP 状态码
+    Message string `json:"message"` // 描述信息
+    Data    any    `json:"data"`    // 业务数据（错误时省略）
+}
+```
+
+所有 API 端点统一使用 `Response` 信封返回数据，调用方只需解析一种结构。`Code` 为 `0` 表示成功，非零时等于 HTTP 状态码（如 `400`、`404`、`500`），便于程序化错误处理。
+
+### 4.6 ListData 列表数据封装
+
+```go
+type ListData struct {
+    Items any `json:"items"` // 数据列表
+    Total int `json:"total"` // 总数
+}
+```
+
+列表类接口返回时，`Response.Data` 统一为 `ListData` 结构，包含 `items`（数据数组）和 `total`（总条数），方便前端分页处理。
+
+### 4.7 状态机
 
 ```
               创建
@@ -238,26 +263,79 @@ type CreateJobParams struct {
 
 ## 5. API 设计
 
-### 5.1 端点列表
+### 5.1 统一响应格式
 
-| 方法 | 路径 | 说明 | 响应码 |
+所有接口统一使用 `Response` 信封返回，调用方只需解析一种结构：
+
+**成功响应（单资源）**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": { ... }
+}
+```
+
+**成功响应（列表）**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "items": [ ... ],
+    "total": 3
+  }
+}
+```
+
+**错误响应**
+
+```json
+{
+  "code": 400,
+  "message": "vendor_id, event and biz_id are required"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `code` | `int` | 业务码，`0` 表示成功，非零等于 HTTP 状态码 |
+| `message` | `string` | 描述信息，成功时为 `"success"`，失败时为错误原因 |
+| `data` | `object` | 业务数据，错误时省略 |
+
+### 5.2 端点列表
+
+| 方法 | 路径 | 说明 | 成功响应码 |
 |------|------|------|--------|
-| `POST` | `/api/notifications` | 创建通知任务（幂等） | `202` / `200` / `400` |
-| `GET` | `/api/notifications/{id}` | 查询单个任务 | `200` / `404` |
+| `POST` | `/api/notifications` | 创建通知任务（幂等） | `202` / `200` |
+| `GET` | `/api/notifications/{id}` | 查询单个任务 | `200` |
 | `GET` | `/api/notifications/failed` | 列出所有失败任务 | `200` |
-| `POST` | `/api/notifications/{id}/replay` | 重放失败任务 | `200` / `400` |
-| `POST` | `/api/vendors` | 创建供应商配置 | `201` / `400` |
+| `POST` | `/api/notifications/{id}/replay` | 重放失败任务 | `200` |
+| `POST` | `/api/vendors` | 创建供应商配置 | `201` |
 | `GET` | `/api/vendors` | 列出所有供应商 | `200` |
-| `GET` | `/api/vendors/{id}` | 查询单个供应商 | `200` / `404` |
-| `PUT` | `/api/vendors/{id}` | 更新供应商配置 | `200` / `400` |
-| `DELETE` | `/api/vendors/{id}` | 停用供应商（软删除） | `200` / `400` |
+| `GET` | `/api/vendors/{id}` | 查询单个供应商 | `200` |
+| `PUT` | `/api/vendors/{id}` | 更新供应商配置 | `200` |
+| `DELETE` | `/api/vendors/{id}` | 停用供应商（软删除） | `200` |
 | `GET` | `/health` | 健康检查 | `200` |
 
-### 5.2 创建通知（核心接口）
+### 5.3 通知接口
+
+#### 5.3.1 创建通知 `POST /api/notifications`
 
 调用方只需指定 `vendor_id`、`event`、`biz_id` 和可选的 `payload`，系统自动通过 Vendor 适配器构建完整的 HTTP 请求。接口支持幂等：相同 `(vendor_id, event, biz_id)` 组合的重复请求不会创建新 Job，而是返回已有记录。
 
-**请求**
+**请求参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `vendor_id` | `string` | 是 | 供应商 ID，必须对应已存在的活跃供应商 |
+| `event` | `string` | 是 | 业务事件名称（如 `"user_registered"`） |
+| `biz_id` | `string` | 是 | 业务去重标识，与 `vendor_id` + `event` 组成唯一键 |
+| `payload` | `object` | 否 | 事件负载数据，传入模板渲染 |
+
+**请求示例**
 
 ```json
 POST /api/notifications
@@ -274,43 +352,232 @@ Content-Type: application/json
 }
 ```
 
-**响应（首次创建）**
+**响应参数（data 字段）**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | `int` | Job 主键 |
+| `vendor_id` | `string` | 供应商 ID |
+| `event` | `string` | 事件名称 |
+| `biz_id` | `string` | 业务去重标识 |
+| `url` | `string` | 投递目标 URL（由 Vendor 解析） |
+| `method` | `string` | HTTP 方法（由 Vendor 解析） |
+| `headers` | `object` | 请求头（由 Vendor 解析） |
+| `body` | `string` | 请求体（由模板渲染） |
+| `status` | `string` | 任务状态：`pending` / `processing` / `completed` / `failed` |
+| `retry_count` | `int` | 已重试次数 |
+| `max_retries` | `int` | 最大重试次数 |
+| `next_retry_at` | `string` | 下次重试时间（RFC3339） |
+| `last_error` | `string` | 最近一次失败原因 |
+| `created_at` | `string` | 创建时间（RFC3339） |
+| `updated_at` | `string` | 更新时间（RFC3339） |
+
+**响应示例（首次创建 — 202）**
 
 ```json
 HTTP/1.1 202 Accepted
 
 {
-  "message": "notification enqueued",
-  "job": {
+  "code": 0,
+  "message": "success",
+  "data": {
     "id": 1,
     "vendor_id": "crm_vendor",
     "event": "user_registered",
     "biz_id": "user_123",
     "url": "https://crm.example.com/api",
     "method": "POST",
+    "headers": {"Content-Type": "application/json"},
+    "body": "{\"event\": \"user_registered\", \"data\": {\"user_id\":123}}",
+    "status": "pending",
+    "retry_count": 0,
+    "max_retries": 3,
+    "next_retry_at": "2026-03-18T12:00:00Z",
+    "created_at": "2026-03-18T12:00:00Z",
+    "updated_at": "2026-03-18T12:00:00Z"
+  }
+}
+```
+
+**响应示例（重复请求 — 200）**
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "id": 1,
+    "vendor_id": "crm_vendor",
+    "event": "user_registered",
+    "biz_id": "user_123",
     "status": "pending",
     ...
   }
 }
 ```
 
-**响应（重复请求）**
+**错误响应示例**
+
+```json
+HTTP/1.1 400 Bad Request
+
+{
+  "code": 400,
+  "message": "vendor_id, event and biz_id are required"
+}
+```
+
+#### 5.3.2 查询通知 `GET /api/notifications/{id}`
+
+**路径参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `id` | `int` | 是 | Job ID（正整数） |
+
+**响应参数** — 同 5.3.1 的 `data` 字段。
+
+**响应示例**
 
 ```json
 HTTP/1.1 200 OK
 
 {
-  "message": "duplicate notification, returning existing job",
-  "job": {
+  "code": 0,
+  "message": "success",
+  "data": {
     "id": 1,
+    "vendor_id": "crm_vendor",
+    "event": "user_registered",
+    "biz_id": "user_123",
+    "url": "https://crm.example.com/api",
+    "method": "POST",
+    "status": "completed",
+    "retry_count": 0,
+    "max_retries": 3,
+    "created_at": "2026-03-18T12:00:00Z",
+    "updated_at": "2026-03-18T12:00:05Z"
+  }
+}
+```
+
+**错误响应示例**
+
+```json
+HTTP/1.1 404 Not Found
+
+{
+  "code": 404,
+  "message": "job not found"
+}
+```
+
+#### 5.3.3 列出失败任务 `GET /api/notifications/failed`
+
+无请求参数。
+
+**响应参数（data 字段）**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `items` | `Job[]` | 失败任务列表（Job 结构同 5.3.1） |
+| `total` | `int` | 总条数 |
+
+**响应示例**
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "items": [
+      {
+        "id": 3,
+        "vendor_id": "ad_system",
+        "event": "click",
+        "biz_id": "click_789",
+        "status": "failed",
+        "retry_count": 3,
+        "max_retries": 3,
+        "last_error": "HTTP 503 Service Unavailable",
+        ...
+      }
+    ],
+    "total": 1
+  }
+}
+```
+
+#### 5.3.4 重放任务 `POST /api/notifications/{id}/replay`
+
+将一个 `failed` 状态的任务重置为 `pending`，清零重试计数，重新进入投递队列。
+
+**路径参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `id` | `int` | 是 | Job ID（必须处于 `failed` 状态） |
+
+无请求体。
+
+**响应参数** — 同 5.3.1 的 `data` 字段（重置后的 Job）。
+
+**响应示例**
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "id": 3,
+    "vendor_id": "ad_system",
+    "event": "click",
+    "biz_id": "click_789",
+    "status": "pending",
+    "retry_count": 0,
+    "max_retries": 3,
+    "last_error": "",
     ...
   }
 }
 ```
 
-### 5.3 Vendor 管理接口
+**错误响应示例**
 
-**创建供应商**
+```json
+HTTP/1.1 400 Bad Request
+
+{
+  "code": 400,
+  "message": "job 99 not found or not in failed status"
+}
+```
+
+### 5.4 Vendor 管理接口
+
+#### 5.4.1 创建供应商 `POST /api/vendors`
+
+**请求参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `id` | `string` | 是 | 供应商唯一标识（如 `"crm_vendor"`） |
+| `name` | `string` | 是 | 供应商显示名称 |
+| `base_url` | `string` | 是 | 投递目标 URL，必须为合法 `http`/`https` URL |
+| `method` | `string` | 否 | HTTP 方法，默认 `"POST"` |
+| `auth_type` | `string` | 否 | 认证类型（`"bearer"` / `"api_key"` / `"basic"` / `""`） |
+| `auth_config` | `object` | 否 | 认证配置（如 `{"token": "xxx"}`） |
+| `headers` | `object` | 否 | 默认请求头 |
+| `body_tpl` | `string` | 否 | 请求体模板（Go text/template 语法） |
+| `max_retries` | `int` | 否 | 最大重试次数，默认 `3` |
+
+**请求示例**
 
 ```json
 POST /api/vendors
@@ -329,7 +596,152 @@ Content-Type: application/json
 }
 ```
 
-**更新供应商**
+**响应参数（data 字段）**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | `string` | 供应商唯一标识 |
+| `name` | `string` | 显示名称 |
+| `base_url` | `string` | 投递目标 URL |
+| `method` | `string` | HTTP 方法 |
+| `auth_type` | `string` | 认证类型 |
+| `auth_config` | `object` | 认证配置 |
+| `headers` | `object` | 默认请求头 |
+| `body_tpl` | `string` | 请求体模板 |
+| `max_retries` | `int` | 最大重试次数 |
+| `is_active` | `bool` | 是否启用 |
+| `created_at` | `string` | 创建时间（RFC3339） |
+| `updated_at` | `string` | 更新时间（RFC3339） |
+
+**响应示例**
+
+```json
+HTTP/1.1 201 Created
+
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "id": "crm_vendor",
+    "name": "CRM System",
+    "base_url": "https://crm.example.com/api",
+    "method": "POST",
+    "auth_type": "bearer",
+    "auth_config": {"token": "secret-token"},
+    "headers": {"Content-Type": "application/json"},
+    "body_tpl": "{\"event\": {{json .Event}}, \"data\": {{json .Payload}}}",
+    "max_retries": 5,
+    "is_active": true,
+    "created_at": "2026-03-18T12:00:00Z",
+    "updated_at": "2026-03-18T12:00:00Z"
+  }
+}
+```
+
+#### 5.4.2 查询供应商 `GET /api/vendors/{id}`
+
+**路径参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `id` | `string` | 是 | 供应商 ID |
+
+**响应参数** — 同 5.4.1 的 `data` 字段。
+
+**响应示例**
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "id": "crm_vendor",
+    "name": "CRM System",
+    "base_url": "https://crm.example.com/api",
+    "method": "POST",
+    "max_retries": 5,
+    "is_active": true,
+    ...
+  }
+}
+```
+
+**错误响应示例**
+
+```json
+HTTP/1.1 404 Not Found
+
+{
+  "code": 404,
+  "message": "vendor not found"
+}
+```
+
+#### 5.4.3 列出供应商 `GET /api/vendors`
+
+无请求参数。
+
+**响应参数（data 字段）**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `items` | `VendorConfig[]` | 供应商列表（结构同 5.4.1） |
+| `total` | `int` | 总条数 |
+
+**响应示例**
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "items": [
+      {
+        "id": "crm_vendor",
+        "name": "CRM System",
+        "base_url": "https://crm.example.com/api",
+        "is_active": true,
+        ...
+      },
+      {
+        "id": "ad_system",
+        "name": "广告系统",
+        "base_url": "https://example.com/ad/callback",
+        "is_active": true,
+        ...
+      }
+    ],
+    "total": 2
+  }
+}
+```
+
+#### 5.4.4 更新供应商 `PUT /api/vendors/{id}`
+
+**路径参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `id` | `string` | 是 | 供应商 ID |
+
+**请求参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `name` | `string` | 是 | 供应商显示名称 |
+| `base_url` | `string` | 是 | 投递目标 URL |
+| `method` | `string` | 否 | HTTP 方法，默认 `"POST"` |
+| `auth_type` | `string` | 否 | 认证类型 |
+| `auth_config` | `object` | 否 | 认证配置 |
+| `headers` | `object` | 否 | 默认请求头 |
+| `body_tpl` | `string` | 否 | 请求体模板 |
+| `max_retries` | `int` | 否 | 最大重试次数，默认 `3` |
+
+**请求示例**
 
 ```json
 PUT /api/vendors/crm_vendor
@@ -342,9 +754,80 @@ Content-Type: application/json
 }
 ```
 
-**停用供应商** — `DELETE /api/vendors/{id}` 执行软删除，将 `is_active` 设为 `false`，保留历史数据。
+**响应参数** — 同 5.4.1 的 `data` 字段（更新后的完整供应商配置）。
 
-### 5.4 输入校验规则
+**响应示例**
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "id": "crm_vendor",
+    "name": "CRM System v2",
+    "base_url": "https://crm2.example.com/api",
+    "method": "PUT",
+    "is_active": true,
+    ...
+  }
+}
+```
+
+#### 5.4.5 停用供应商 `DELETE /api/vendors/{id}`
+
+执行软删除，将 `is_active` 设为 `false`，保留历史数据。
+
+**路径参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `id` | `string` | 是 | 供应商 ID（必须处于启用状态） |
+
+无请求体。
+
+**响应示例**
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "code": 0,
+  "message": "success"
+}
+```
+
+**错误响应示例**
+
+```json
+HTTP/1.1 400 Bad Request
+
+{
+  "code": 400,
+  "message": "vendor \"unknown\" not found or already inactive"
+}
+```
+
+### 5.5 健康检查 `GET /health`
+
+无请求参数。
+
+**响应示例**
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "status": "ok"
+  }
+}
+```
+
+### 5.6 输入校验规则
 
 **通知创建接口**
 
@@ -366,6 +849,15 @@ Content-Type: application/json
 | base_url | 必填，必须为合法的 `http`/`https` URL |
 | method | 可选，默认 `POST` |
 | max_retries | 可选，默认 3 |
+
+**通用错误码**
+
+| HTTP 状态码 | `code` | 含义 |
+|-------------|--------|------|
+| `400` | `400` | 请求参数校验失败 |
+| `404` | `404` | 资源不存在 |
+| `405` | `405` | HTTP 方法不允许 |
+| `500` | `500` | 服务器内部错误 |
 
 ---
 
@@ -606,7 +1098,7 @@ main()
 
 | 层 | 策略 |
 |----|------|
-| **handler** | 返回结构化 JSON 错误响应，区分 `400`/`404`/`405`/`500`；Vendor 不存在时返回 `400`；重复提交返回 `200` |
+| **handler** | 统一使用 `Response` 信封返回（`respondSuccess` / `respondError` / `respondList`），`code=0` 表示成功，非零为 HTTP 状态码；Vendor 不存在返回 `400`；重复提交返回 `200` |
 | **adapter** | 适配器构建失败时返回 error，由 handler 转为 `500` 响应 |
 | **store** | 用 `fmt.Errorf("%w")` 包装错误向上传播，JSON 解析容错返回空 map |
 | **worker** | 日志记录 + 状态流转（MarkRetry / MarkFailed），不 panic |

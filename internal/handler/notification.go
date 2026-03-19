@@ -30,7 +30,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/vendors", h.handleVendors)
 	mux.HandleFunc("/api/vendors/", h.handleVendorByID)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		respondSuccess(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 }
 
@@ -46,7 +46,7 @@ func (h *Handler) handleNotifications(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleNotificationByID(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/notifications/")
 	if path == "" {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "route not found"})
+		respondError(w, http.StatusNotFound, "route not found")
 		return
 	}
 
@@ -64,7 +64,7 @@ func (h *Handler) handleNotificationByID(w http.ResponseWriter, r *http.Request)
 	case len(parts) == 1:
 		id, err := parseJobID(parts[0])
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid job id"})
+			respondError(w, http.StatusBadRequest, "invalid job id")
 			return
 		}
 		if r.Method != http.MethodGet {
@@ -75,7 +75,7 @@ func (h *Handler) handleNotificationByID(w http.ResponseWriter, r *http.Request)
 	case len(parts) == 2 && parts[1] == "replay":
 		id, err := parseJobID(parts[0])
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid job id"})
+			respondError(w, http.StatusBadRequest, "invalid job id")
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -84,7 +84,7 @@ func (h *Handler) handleNotificationByID(w http.ResponseWriter, r *http.Request)
 		}
 		h.Replay(w, r, id)
 	default:
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "route not found"})
+		respondError(w, http.StatusNotFound, "route not found")
 	}
 }
 
@@ -101,14 +101,14 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	if err := decoder.Decode(&req); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body too large"})
+			respondError(w, http.StatusBadRequest, "request body too large")
 			return
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json: " + err.Error()})
+		respondError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must contain a single JSON object"})
+		respondError(w, http.StatusBadRequest, "request body must contain a single JSON object")
 		return
 	}
 
@@ -117,19 +117,19 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	req.BizID = strings.TrimSpace(req.BizID)
 
 	if req.VendorID == "" || req.Event == "" || req.BizID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "vendor_id, event and biz_id are required"})
+		respondError(w, http.StatusBadRequest, "vendor_id, event and biz_id are required")
 		return
 	}
 
 	adapter, err := h.registry.Resolve(req.VendorID)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	resolved, err := adapter.BuildRequest(req.Event, req.Payload)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to build request: " + err.Error()})
+		respondError(w, http.StatusInternalServerError, "failed to build request: "+err.Error())
 		return
 	}
 
@@ -144,67 +144,45 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		MaxRetries: resolved.MaxRetries,
 	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to enqueue notification"})
+		respondError(w, http.StatusInternalServerError, "failed to enqueue notification")
 		return
 	}
 
 	if isNew {
-		writeJSON(w, http.StatusAccepted, map[string]any{
-			"message": "notification enqueued",
-			"job":     job,
-		})
+		respondSuccess(w, http.StatusAccepted, job)
 	} else {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"message": "duplicate notification, returning existing job",
-			"job":     job,
-		})
+		respondSuccess(w, http.StatusOK, job)
 	}
 }
 
 func (h *Handler) Get(w http.ResponseWriter, _ *http.Request, id int64) {
 	job, err := h.store.GetJob(id)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+		respondError(w, http.StatusNotFound, "job not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	respondSuccess(w, http.StatusOK, job)
 }
 
 func (h *Handler) ListFailed(w http.ResponseWriter, _ *http.Request) {
 	jobs, err := h.store.ListFailedJobs()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list jobs"})
+		respondError(w, http.StatusInternalServerError, "failed to list jobs")
 		return
 	}
 	if jobs == nil {
 		jobs = []model.Job{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs, "count": len(jobs)})
+	respondList(w, jobs, len(jobs))
 }
 
 func (h *Handler) Replay(w http.ResponseWriter, _ *http.Request, id int64) {
 	job, err := h.store.ResetJob(id)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"message": "job replayed",
-		"job":     job,
-	})
-}
-
-func writeJSON(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
-}
-
-func methodNotAllowed(w http.ResponseWriter, allowedMethods ...string) {
-	if len(allowedMethods) > 0 {
-		w.Header().Set("Allow", strings.Join(allowedMethods, ", "))
-	}
-	writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	respondSuccess(w, http.StatusOK, job)
 }
 
 func parseJobID(raw string) (int64, error) {

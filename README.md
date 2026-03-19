@@ -86,8 +86,12 @@ go run main.go
 
 ### API 示例
 
+所有接口统一使用 `{code, message, data}` 信封格式返回，`code=0` 表示成功。
+
+> 完整的请求参数和响应参数说明见 [架构设计文档 §5](./ARCHITECTURE.md#5-api-设计)
+
 ```bash
-# 提交通知请求（立即返回 202）
+# 提交通知请求（首次 202，重复 200）
 curl -X POST http://localhost:8080/api/notifications \
   -H "Content-Type: application/json" \
   -d '{
@@ -96,18 +100,23 @@ curl -X POST http://localhost:8080/api/notifications \
     "biz_id": "user_123",
     "payload": {"user_id": 123, "name": "Alice"}
   }'
+# → {"code":0,"message":"success","data":{"id":1,"vendor_id":"crm_vendor",...}}
 
 # 查询 Job 状态
 curl http://localhost:8080/api/notifications/1
+# → {"code":0,"message":"success","data":{"id":1,"status":"completed",...}}
 
 # 查看所有失败的 Job
 curl http://localhost:8080/api/notifications/failed
+# → {"code":0,"message":"success","data":{"items":[...],"total":0}}
 
 # 手动重放某个失败 Job
 curl -X POST http://localhost:8080/api/notifications/1/replay
+# → {"code":0,"message":"success","data":{"id":1,"status":"pending",...}}
 
 # 健康检查
 curl http://localhost:8080/health
+# → {"code":0,"message":"success","data":{"status":"ok"}}
 ```
 
 ## 未来演进方向

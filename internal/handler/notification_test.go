@@ -44,6 +44,25 @@ func seedVendor(t *testing.T, s *store.Store) {
 	}
 }
 
+// decodeResponse is a test helper that unmarshals the unified response envelope.
+func decodeResponse(t *testing.T, body []byte, data any) model.Response {
+	t.Helper()
+	var resp struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode response envelope: %v", err)
+	}
+	if data != nil && len(resp.Data) > 0 {
+		if err := json.Unmarshal(resp.Data, data); err != nil {
+			t.Fatalf("decode response data: %v", err)
+		}
+	}
+	return model.Response{Code: resp.Code, Message: resp.Message}
+}
+
 func TestHandleNotificationByID_StrictPath(t *testing.T) {
 	mux, _ := newTestHandler(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/notifications/1/extra", nil)
@@ -80,32 +99,25 @@ func TestCreate_ResolvesVendorAndCreatesJob(t *testing.T) {
 		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	var resp struct {
-		Job struct {
-			VendorID string `json:"vendor_id"`
-			Event    string `json:"event"`
-			BizID    string `json:"biz_id"`
-			URL      string `json:"url"`
-			Method   string `json:"method"`
-		} `json:"job"`
+	var job model.Job
+	resp := decodeResponse(t, rec.Body.Bytes(), &job)
+	if resp.Code != 0 {
+		t.Fatalf("expected code 0, got %d", resp.Code)
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
+	if job.VendorID != "test_vendor" {
+		t.Fatalf("expected vendor_id %q, got %q", "test_vendor", job.VendorID)
 	}
-	if resp.Job.VendorID != "test_vendor" {
-		t.Fatalf("expected vendor_id %q, got %q", "test_vendor", resp.Job.VendorID)
+	if job.Event != "user_registered" {
+		t.Fatalf("expected event %q, got %q", "user_registered", job.Event)
 	}
-	if resp.Job.Event != "user_registered" {
-		t.Fatalf("expected event %q, got %q", "user_registered", resp.Job.Event)
+	if job.BizID != "user_123" {
+		t.Fatalf("expected biz_id %q, got %q", "user_123", job.BizID)
 	}
-	if resp.Job.BizID != "user_123" {
-		t.Fatalf("expected biz_id %q, got %q", "user_123", resp.Job.BizID)
+	if job.URL != "https://example.com/hook" {
+		t.Fatalf("expected url from vendor config, got %q", job.URL)
 	}
-	if resp.Job.URL != "https://example.com/hook" {
-		t.Fatalf("expected url from vendor config, got %q", resp.Job.URL)
-	}
-	if resp.Job.Method != "POST" {
-		t.Fatalf("expected method POST, got %q", resp.Job.Method)
+	if job.Method != "POST" {
+		t.Fatalf("expected method POST, got %q", job.Method)
 	}
 }
 
@@ -183,7 +195,7 @@ func TestVendorCRUD(t *testing.T) {
 		t.Fatalf("get vendor: expected 200, got %d", rec.Code)
 	}
 	var v model.VendorConfig
-	json.Unmarshal(rec.Body.Bytes(), &v)
+	decodeResponse(t, rec.Body.Bytes(), &v)
 	if v.Name != "CRM" || v.MaxRetries != 5 {
 		t.Fatalf("unexpected vendor: %+v", v)
 	}

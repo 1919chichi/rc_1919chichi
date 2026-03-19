@@ -25,12 +25,11 @@ func (h *Handler) handleVendors(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleVendorByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/vendors/")
 	if id == "" {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "route not found"})
+		respondError(w, http.StatusNotFound, "route not found")
 		return
 	}
-	// reject paths with extra segments like /api/vendors/foo/bar
 	if strings.Contains(id, "/") {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "route not found"})
+		respondError(w, http.StatusNotFound, "route not found")
 		return
 	}
 
@@ -56,14 +55,14 @@ func (h *Handler) CreateVendor(w http.ResponseWriter, r *http.Request) {
 	if err := decoder.Decode(&req); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body too large"})
+			respondError(w, http.StatusBadRequest, "request body too large")
 			return
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json: " + err.Error()})
+		respondError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must contain a single JSON object"})
+		respondError(w, http.StatusBadRequest, "request body must contain a single JSON object")
 		return
 	}
 
@@ -72,42 +71,42 @@ func (h *Handler) CreateVendor(w http.ResponseWriter, r *http.Request) {
 	req.BaseURL = strings.TrimSpace(req.BaseURL)
 
 	if req.ID == "" || req.Name == "" || req.BaseURL == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id, name and base_url are required"})
+		respondError(w, http.StatusBadRequest, "id, name and base_url are required")
 		return
 	}
 
 	if u, err := url.ParseRequestURI(req.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_url must be a valid http/https URL"})
+		respondError(w, http.StatusBadRequest, "base_url must be a valid http/https URL")
 		return
 	}
 
 	v, err := h.store.CreateVendor(req)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create vendor: " + err.Error()})
+		respondError(w, http.StatusInternalServerError, "failed to create vendor: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, v)
+	respondSuccess(w, http.StatusCreated, v)
 }
 
 func (h *Handler) GetVendor(w http.ResponseWriter, _ *http.Request, id string) {
 	v, err := h.store.GetVendor(id)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "vendor not found"})
+		respondError(w, http.StatusNotFound, "vendor not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, v)
+	respondSuccess(w, http.StatusOK, v)
 }
 
 func (h *Handler) ListVendors(w http.ResponseWriter, _ *http.Request) {
 	vendors, err := h.store.ListVendors()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list vendors"})
+		respondError(w, http.StatusInternalServerError, "failed to list vendors")
 		return
 	}
 	if vendors == nil {
 		vendors = []model.VendorConfig{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"vendors": vendors, "count": len(vendors)})
+	respondList(w, vendors, len(vendors))
 }
 
 func (h *Handler) UpdateVendor(w http.ResponseWriter, r *http.Request, id string) {
@@ -120,14 +119,14 @@ func (h *Handler) UpdateVendor(w http.ResponseWriter, r *http.Request, id string
 	if err := decoder.Decode(&req); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body too large"})
+			respondError(w, http.StatusBadRequest, "request body too large")
 			return
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json: " + err.Error()})
+		respondError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must contain a single JSON object"})
+		respondError(w, http.StatusBadRequest, "request body must contain a single JSON object")
 		return
 	}
 
@@ -135,27 +134,27 @@ func (h *Handler) UpdateVendor(w http.ResponseWriter, r *http.Request, id string
 	req.BaseURL = strings.TrimSpace(req.BaseURL)
 
 	if req.Name == "" || req.BaseURL == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and base_url are required"})
+		respondError(w, http.StatusBadRequest, "name and base_url are required")
 		return
 	}
 
 	if u, err := url.ParseRequestURI(req.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_url must be a valid http/https URL"})
+		respondError(w, http.StatusBadRequest, "base_url must be a valid http/https URL")
 		return
 	}
 
 	v, err := h.store.UpdateVendor(id, req)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, v)
+	respondSuccess(w, http.StatusOK, v)
 }
 
 func (h *Handler) DeleteVendor(w http.ResponseWriter, _ *http.Request, id string) {
 	if err := h.store.DeleteVendor(id); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"message": "vendor deactivated"})
+	respondSuccess(w, http.StatusOK, nil)
 }
